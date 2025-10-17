@@ -1,0 +1,104 @@
+# GitHub Actions workflow: download a zip from FTP, extract it, delete the zip, and upload extracted files back to FTP
+# This version uses workflow_dispatch inputs (less secure) instead of repository secrets.
+#
+# IMPORTANT SECURITY NOTE:
+# - Using workflow_dispatch inputs means credentials will be entered when manually running the workflow and are not stored as encrypted repository secrets.
+# - Do NOT use this in production or with sensitive credentials you don't want exposed.
+on:
+  workflow_dispatch:
+    inputs:
+      ftp_host:
+        description: 'FTP host (e.g. ftp.minefort.com)'
+        required: true
+        default: 'ftp.minefort.com'
+      ftp_port:
+        description: 'FTP port (e.g. 21)'
+        required: true
+        default: '21'
+      ftp_user:
+        description: 'FTP username'
+        required: true
+        default: 'RYLOU0gwZn'
+      ftp_pass:
+        description: 'FTP password (will be visible when running the workflow)'
+        required: true
+        default: 'gQT90ExX3a'
+      zip_name:
+        description: 'Zip file name on the FTP server'
+        required: true
+        default: 'pD2ZOpEeq5.zip'
+      extract_dir:
+        description: 'Local directory to extract into'
+        required: true
+        default: 'extracted'
+      remote_dir:
+        description: 'Remote directory to upload files to (remote path used by lftp mirror)'
+        required: true
+        default: '/'
+name: FTP download-extract-upload (dispatch inputs)
+
+jobs:
+  ftp-transfer:
+    runs-on: ubuntu-latest
+    env:
+      FTP_HOST: ${{ github.event.inputs.ftp_host }}
+      FTP_PORT: ${{ github.event.inputs.ftp_port }}
+      FTP_USER: ${{ github.event.inputs.ftp_user }}
+      FTP_PASS: ${{ github.event.inputs.ftp_pass }}
+      ZIP_NAME: ${{ github.event.inputs.zip_name }}
+      EXTRACT_DIR: ${{ github.event.inputs.extract_dir }}
+      REMOTE_DIR: ${{ github.event.inputs.remote_dir }}
+    steps:
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y lftp unzip curl
+
+      - name: Show non-sensitive configuration
+        run: |
+          echo "FTP host: $FTP_HOST"
+          echo "FTP port: $FTP_PORT"
+          echo "FTP user: $FTP_USER"
+          echo "Zip name: $ZIP_NAME"
+          echo "Extract dir: $EXTRACT_DIR"
+          echo "Remote dir: $REMOTE_DIR"
+          echo "WARNING: ftp_pass is not printed because it is sensitive."
+
+      - name: Download zip from FTP
+        run: |
+          set -e
+          echo "Downloading ${ZIP_NAME} from ftp://${FTP_HOST}:${FTP_PORT}/"
+          curl --ftp-pasv --fail -u "${FTP_USER}:${FTP_PASS}" "ftp://${FTP_HOST}:${FTP_PORT}/${ZIP_NAME}" -o "${ZIP_NAME}"
+          echo "Downloaded ${ZIP_NAME} (size: $(stat -c%s "${ZIP_NAME}") bytes)"
+
+      - name: Extract ZIP and remove zip file
+        run: |
+          set -e
+          mkdir -p "${EXTRACT_DIR}"
+          echo "Extracting ${ZIP_NAME} to ${EXTRACT_DIR}..."
+          unzip -q "${ZIP_NAME}" -d "${EXTRACT_DIR}"
+          echo "Extraction finished. Listing ${EXTRACT_DIR}:"
+          ls -la "${EXTRACT_DIR}" || true
+          echo "Deleting ${ZIP_NAME}..."
+          rm -f "${ZIP_NAME}"
+          echo "${ZIP_NAME} deleted."
+
+      - name: Upload extracted files back to FTP (recursive)
+        run: |
+          set -e
+          echo "Uploading contents of ${EXTRACT_DIR} to ftp://${FTP_HOST}:${FTP_PORT}${REMOTE_DIR} ..."
+          # lftp mirror -R will upload recursively from local -> remote
+          lftp -u "${FTP_USER}","${FTP_PASS}" -p "${FTP_PORT}" "ftp://${FTP_HOST}" -e "set ftp:passive-mode true; mirror --reverse --only-newer --verbose --parallel=2 --continue ${EXTRACT_DIR} ${REMOTE_DIR}; bye"
+          echo "Upload completed."
+
+      - name: Cleanup extracted files
+        if: always()
+        run: |
+          set -e
+          echo "Cleaning up workspace..."
+          rm -rf "${EXTRACT_DIR}"
+          echo "Done."
+
+      - name: Finished
+        run: echo "FTP download, extraction, deletion, and upload finished."
