@@ -1,331 +1,151 @@
-# GitHub Actions workflow: robust Python FTP download/extract/upload with magic-byte checks and curl fallback.
-# This workflow uses workflow_dispatch inputs (less secure) and performs FTP logic in Python.
-# It checks the downloaded file's magic bytes before trying to open with zipfile. If the download looks wrong
-# it attempts a curl fallback, prints a short snippet of the downloaded content for debugging, and fails with
-# an informative message.
-#
-# SECURITY NOTE:
-# - workflow_dispatch inputs are visible to anyone who can run the workflow. Do NOT use this with sensitive credentials in production.
+name: upload-to-ftp
 on:
   workflow_dispatch:
-    inputs:
-      ftp_host:
-        description: 'FTP host (e.g. ftp.minefort.com)'
-        required: true
-        default: 'ftp.minefort.com'
-      ftp_port:
-        description: 'FTP port (e.g. 21)'
-        required: true
-        default: '21'
-      ftp_user:
-        description: 'FTP username'
-        required: true
-        default: 'RYLOU0gwZn'
-      ftp_pass:
-        description: 'FTP password (will be visible when running the workflow)'
-        required: true
-        default: 'gQT90ExX3a'
-      zip_name:
-        description: 'Zip file name on the FTP server (or relative path)'
-        required: true
-        default: 'pD2ZOpEeq5.zip'
-      extract_dir:
-        description: 'Local directory to extract into'
-        required: true
-        default: 'extracted'
-      remote_dir:
-        description: 'Remote directory to upload files to (remote path used by the FTP server)'
-        required: true
-        default: '/'
-name: FTP download-extract-upload (dispatch inputs, python, robust)
 
 jobs:
-  ftp-transfer:
+  upload:
     runs-on: ubuntu-latest
-    env:
-      FTP_HOST: ${{ github.event.inputs.ftp_host }}
-      FTP_PORT: ${{ github.event.inputs.ftp_port }}
-      FTP_USER: ${{ github.event.inputs.ftp_user }}
-      FTP_PASS: ${{ github.event.inputs.ftp_pass }}
-      ZIP_NAME: ${{ github.event.inputs.zip_name }}
-      EXTRACT_DIR: ${{ github.event.inputs.extract_dir }}
-      REMOTE_DIR: ${{ github.event.inputs.remote_dir }}
     steps:
-      - name: Prepare runner (install curl)
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y curl
-
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.x"
 
-      - name: Run robust Python FTP download/extract/upload script
+      - name: Download, extract and upload to FTP (inlined Python)
         env:
-          FTP_HOST: ${{ env.FTP_HOST }}
-          FTP_PORT: ${{ env.FTP_PORT }}
-          FTP_USER: ${{ env.FTP_USER }}
-          FTP_PASS: ${{ env.FTP_PASS }}
-          ZIP_NAME: ${{ env.ZIP_NAME }}
-          EXTRACT_DIR: ${{ env.EXTRACT_DIR }}
-          REMOTE_DIR: ${{ env.REMOTE_DIR }}
+          ZIP_URL: "https://github.com/SCPF-Bot/mozilla.android/releases/download/latest/pD2ZOpEeq5.zip"
+          ZIP_NAME: "pD2ZOpEeq5.zip"
+          EXTRACT_DIR: "extracted"
+          FTP_HOST_PORT: "ftp.minefort.com:21"
+          FTP_USER: "RYLOU0gwZn"
+          FTP_PASS: "gQT90ExX3a"
+          REMOTE_BASE_DIR: ""  # set a remote base path here if desired
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import os
-          import sys
-          import ftplib
+          import shutil
+          import urllib.request
           import zipfile
-          import posixpath
-          import subprocess
-          import time
+          import ftplib
           from pathlib import Path
 
-          # Read environment inputs
-          HOST = os.environ.get("FTP_HOST")
-          PORT = int(os.environ.get("FTP_PORT", "21"))
-          USER = os.environ.get("FTP_USER")
-          PASS = os.environ.get("FTP_PASS")
+          ZIP_URL = os.environ.get("ZIP_URL")
           ZIP_NAME = os.environ.get("ZIP_NAME", "pD2ZOpEeq5.zip")
           EXTRACT_DIR = os.environ.get("EXTRACT_DIR", "extracted")
-          REMOTE_DIR = os.environ.get("REMOTE_DIR", "/")
+          FTP_HOST_PORT = os.environ.get("FTP_HOST_PORT", "ftp.minefort.com:21")
+          FTP_USER = os.environ.get("FTP_USER")
+          FTP_PASS = os.environ.get("FTP_PASS")
+          REMOTE_BASE_DIR = os.environ.get("REMOTE_BASE_DIR", "")
 
-          def log(*args, **kwargs):
-              print(*args, **kwargs, flush=True)
-
-          if not HOST or not USER or PASS is None:
-              log("Missing FTP connection parameters. Aborting.")
-              sys.exit(1)
-
-          local_zip = Path(ZIP_NAME)
-          local_extract = Path(EXTRACT_DIR)
-          local_extract.mkdir(parents=True, exist_ok=True)
-
-          def is_valid_zip(path: Path) -> bool:
-              try:
-                  return zipfile.is_zipfile(path)
-              except Exception:
-                  return False
-
-          def check_magic_bytes(path: Path) -> bool:
-              try:
-                  with open(path, "rb") as f:
-                      hdr = f.read(4)
-                      return hdr.startswith(b"PK")
-              except Exception:
-                  return False
-
-          def download_via_ftplib(retries=3, backoff=2):
-              attempt = 0
-              while attempt < retries:
-                  attempt += 1
+          def parse_host_port(hp: str):
+              if ":" in hp:
+                  host, port = hp.rsplit(":", 1)
                   try:
-                      log(f"[ftplib] connecting to {HOST}:{PORT} (attempt {attempt})")
-                      ftp = ftplib.FTP()
-                      ftp.connect(host=HOST, port=PORT, timeout=30)
-                      ftp.login(user=USER, passwd=PASS)
-                      # Ensure binary mode
-                      try:
-                          ftp.voidcmd('TYPE I')
-                      except Exception:
-                          pass
-                      ftp.set_pasv(True)
-                      log("[ftplib] connected, starting RETR")
-                      with open(local_zip, "wb") as f:
-                          def cb(data):
-                              f.write(data)
-                          ftp.retrbinary(f"RETR {ZIP_NAME}", cb)
-                      ftp.quit()
-                      log(f"[ftplib] download finished, size={local_zip.stat().st_size} bytes")
-                      return True
-                  except ftplib.error_perm as e:
-                      log(f"[ftplib] permission/FTP error: {e}")
-                  except Exception as e:
-                      log(f"[ftplib] download failed: {e}")
-                  if attempt < retries:
-                      wait = backoff * attempt
-                      log(f"[ftplib] retrying in {wait}s...")
-                      time.sleep(wait)
-              return False
+                      return host, int(port)
+                  except ValueError:
+                      return host, 21
+              return hp, 21
 
-          def download_via_curl():
-              # curl fallback; caller ensures curl is installed
-              url = f"ftp://{HOST}:{PORT}/{ZIP_NAME}"
-              cmd = ["curl", "--fail", "--silent", "--show-error", "--ftp-pasv", "-u", f"{USER}:{PASS}", "-o", str(local_zip), url]
-              log("[curl] running:", " ".join(cmd))
+          def download_zip(url: str, dest: str):
+              print(f"Downloading {url} -> {dest}")
+              urllib.request.urlretrieve(url, dest)
+              print("Download completed.")
+
+          def extract_zip(zip_path: str, extract_to: str):
+              print(f"Extracting {zip_path} -> {extract_to}")
+              with zipfile.ZipFile(zip_path, "r") as zf:
+                  zf.extractall(extract_to)
+              print("Extraction completed.")
+
+          def remove_file(path: str):
               try:
-                  subprocess.run(cmd, check=True)
-                  log(f"[curl] download finished, size={local_zip.stat().st_size} bytes")
-                  return True
-              except subprocess.CalledProcessError as e:
-                  log(f"[curl] failed: {e}")
-                  return False
-              except Exception as e:
-                  log(f"[curl] unexpected error: {e}")
-                  return False
+                  os.remove(path)
+                  print(f"Removed file {path}")
+              except FileNotFoundError:
+                  print(f"File {path} not found, skipping removal.")
 
-          # 1) Try ftplib download with retries
-          success = download_via_ftplib()
-          # 2) If file not present or not a zip, try curl fallback once
-          if not success or not local_zip.exists() or local_zip.stat().st_size == 0 or not check_magic_bytes(local_zip):
-              log("Downloaded file does not look like a ZIP - trying curl fallback...")
-              try:
-                  # remove partial file if exists
-                  if local_zip.exists():
-                      local_zip.unlink()
-              except Exception:
-                  pass
-              curl_ok = download_via_curl()
-              if not curl_ok:
-                  log("Both ftplib and curl downloads failed. Aborting.")
-                  # If partial file exists, save snippet for debugging
-                  if local_zip.exists():
-                      try:
-                          snippet = local_zip.read_bytes()[:1024]
-                          log("Partial download snippet (first 1KB):")
-                          try:
-                              log(snippet.decode("utf-8", errors="replace"))
-                          except Exception:
-                              log(repr(snippet))
-                      except Exception:
-                          pass
-                  sys.exit(2)
-
-          # 3) Validate magic bytes and zip integrity
-          if not local_zip.exists():
-              log("No zip file was downloaded. Aborting.")
-              sys.exit(3)
-
-          if not check_magic_bytes(local_zip):
-              # Print a short snippet of the bad file to help debugging (do not print enormous content)
-              try:
-                  data = local_zip.read_bytes()
-                  snippet = data[:1024]
-                  log("Downloaded file does not start with PK (zip magic). First 1KB of file (utf-8 replaced):")
-                  log(snippet.decode("utf-8", errors="replace"))
-                  # Save the raw response to a debug file for later inspection
-                  debug_path = local_zip.with_name(local_zip.name + ".download_debug.txt")
-                  with open(debug_path, "wb") as dbg:
-                      dbg.write(data[:10*1024])  # save up to 10KB
-                  log(f"Wrote debug snippet to {debug_path}")
-              except Exception as e:
-                  log(f"Could not read/print downloaded content: {e}")
-              log("Aborting because file does not appear to be a zip archive.")
-              sys.exit(4)
-
-          # Additional safety: use zipfile.is_zipfile
-          if not is_valid_zip(local_zip):
-              log("zipfile.is_zipfile reports false. The file might be corrupted. Aborting.")
-              sys.exit(5)
-
-          # Extract safely
-          try:
-              log(f"Extracting {local_zip} -> {local_extract} ...")
-              with zipfile.ZipFile(local_zip, "r") as zf:
-                  zf.extractall(path=local_extract)
-              log("Extraction complete.")
-          except zipfile.BadZipFile as e:
-              log(f"Bad zip file despite checks: {e}")
-              sys.exit(6)
-          except Exception as e:
-              log(f"Unexpected extraction error: {e}")
-              sys.exit(7)
-
-          # Remove zip after successful extraction
-          try:
-              local_zip.unlink()
-              log(f"Deleted local zip {local_zip}.")
-          except Exception as e:
-              log(f"Warning: could not delete zip: {e}")
-
-          # Upload local directory recursively to remote base (re-using ftplib)
-          def ensure_remote_dir(ftp_conn, remote_path):
-              remote_path = posixpath.normpath(remote_path)
-              if remote_path in ('.', '/'):
-                  try:
-                      ftp_conn.cwd('/')
-                  except Exception:
-                      pass
+          def ensure_remote_dir(ftp: ftplib.FTP, remote_dir: str):
+              """
+              Ensure the remote directory exists by creating each segment if necessary.
+              Leaves the FTP current working directory at the target directory.
+              """
+              if not remote_dir:
                   return
-              parts = [p for p in remote_path.split('/') if p]
+              parts = [p for p in remote_dir.replace("\\", "/").split("/") if p]
+              # Try to start from root; if not allowed, continue from current working dir
               try:
-                  ftp_conn.cwd('/') if remote_path.startswith('/') else None
+                  ftp.cwd("/")
               except Exception:
                   pass
               for part in parts:
                   try:
-                      ftp_conn.cwd(part)
+                      ftp.cwd(part)
                   except ftplib.error_perm:
                       try:
-                          ftp_conn.mkd(part)
-                          ftp_conn.cwd(part)
+                          ftp.mkd(part)
+                          ftp.cwd(part)
                       except Exception as e:
-                          log(f"Failed to create remote dir '{part}': {e}")
-                          raise
-
-          def upload_directory(ftp_conn, local_base: Path, remote_base: str):
-              remote_base = remote_base or '/'
-              remote_base = posixpath.normpath(remote_base)
-              log(f"Uploading {local_base} -> {remote_base}")
-              for root, dirs, files in os.walk(local_base):
-                  rel_root = os.path.relpath(root, local_base)
-                  if rel_root == ".":
-                      rel_root = ""
-                  if rel_root:
-                      target_remote = posixpath.join(remote_base, rel_root).replace("\\", "/")
-                  else:
-                      target_remote = remote_base
-                  ensure_remote_dir(ftp_conn, target_remote)
-                  try:
-                      ftp_conn.cwd(target_remote)
-                  except Exception:
-                      pass
-                  for fname in files:
-                      local_file = Path(root) / fname
-                      log(f"Uploading {local_file} -> {target_remote}/{fname}")
-                      with open(local_file, "rb") as f:
+                          # Some servers behave differently; attempt to cwd again
                           try:
-                              ftp_conn.storbinary(f"STOR {fname}", f)
-                              log("  uploaded.")
+                              ftp.cwd(part)
+                          except Exception:
+                              raise RuntimeError(f"Failed to create or enter remote directory '{part}': {e}")
+
+          def upload_directory(ftp: ftplib.FTP, local_dir: str, remote_base: str = ""):
+              local_dir = os.path.abspath(local_dir)
+              for root, dirs, files in os.walk(local_dir):
+                  rel = os.path.relpath(root, local_dir)
+                  if rel == ".":
+                      remote_dir = remote_base
+                  else:
+                      # normalize to POSIX path for FTP
+                      remote_dir = "/".join(filter(None, [remote_base, rel.replace(os.sep, "/")]))
+                  # ensure remote dir exists and cwd into it
+                  ensure_remote_dir(ftp, remote_dir)
+
+                  for filename in files:
+                      local_path = os.path.join(root, filename)
+                      print(f"Uploading {local_path} -> {remote_dir}/{filename}")
+                      with open(local_path, "rb") as fp:
+                          try:
+                              ftp.storbinary(f"STOR {filename}", fp)
                           except Exception as e:
-                              log(f"  failed to upload {local_file}: {e}")
-                              raise
+                              raise RuntimeError(f"Failed to upload {local_path}: {e}")
 
-          # Connect again and upload
-          try:
-              log(f"Connecting to FTP {HOST}:{PORT} for upload...")
-              ftp_u = ftplib.FTP()
-              ftp_u.connect(host=HOST, port=PORT, timeout=30)
-              ftp_u.login(user=USER, passwd=PASS)
-              ftp_u.set_pasv(True)
-              # Ensure remote base exists
+          def main():
+              # Clean start
+              if os.path.isdir(EXTRACT_DIR):
+                  shutil.rmtree(EXTRACT_DIR)
+
+              # 1. Download
+              download_zip(ZIP_URL, ZIP_NAME)
+
+              # 2. Extract
+              os.makedirs(EXTRACT_DIR, exist_ok=True)
+              extract_zip(ZIP_NAME, EXTRACT_DIR)
+
+              # 3. Delete the zip
+              remove_file(ZIP_NAME)
+
+              # 4. Upload
+              host, port = parse_host_port(FTP_HOST_PORT)
+              print(f"Connecting to FTP {host}:{port} as {FTP_USER}")
+              ftp = ftplib.FTP()
+              ftp.connect(host, port, timeout=30)
+              ftp.login(FTP_USER, FTP_PASS)
+              print("FTP connected and logged in.")
               try:
-                  ensure_remote_dir(ftp_u, REMOTE_DIR)
-              except Exception as e:
-                  log(f"Could not ensure remote directory {REMOTE_DIR}: {e}")
-                  ftp_u.quit()
-                  sys.exit(8)
-              upload_directory(ftp_u, local_extract, REMOTE_DIR)
-              ftp_u.quit()
-              log("Upload complete.")
-          except Exception as e:
-              log(f"Upload failed: {e}")
-              try:
-                  ftp_u.quit()
-              except Exception:
-                  pass
-              sys.exit(9)
+                  upload_directory(ftp, EXTRACT_DIR, REMOTE_BASE_DIR)
+              finally:
+                  try:
+                      ftp.quit()
+                  except Exception:
+                      try:
+                          ftp.close()
+                      except Exception:
+                          pass
+              print("Upload finished.")
 
-          # Cleanup extracted files
-          try:
-              import shutil
-              shutil.rmtree(local_extract)
-              log(f"Cleaned up local extracted directory {local_extract}.")
-          except Exception as e:
-              log(f"Warning: could not fully clean up local extracted directory: {e}")
-
-          log("All done.")
+          if __name__ == "__main__":
+              main()
           PY
-
-      - name: Finished
-        run: echo "FTP download/extract/upload (Python, robust) finished."
