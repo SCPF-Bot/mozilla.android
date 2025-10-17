@@ -27,7 +27,6 @@ jobs:
           import urllib.request
           import zipfile
           import ftplib
-          from pathlib import Path
 
           ZIP_URL = os.environ.get("ZIP_URL")
           ZIP_NAME = os.environ.get("ZIP_NAME", "pD2ZOpEeq5.zip")
@@ -70,12 +69,13 @@ jobs:
               Leaves the FTP current working directory at the target directory.
               """
               if not remote_dir:
+                  # if remote_dir is empty, leave ftp cwd as-is (server's default)
                   return
               parts = [p for p in remote_dir.replace("\\", "/").split("/") if p]
-              # Try to start from root; if not allowed, continue from current working dir
               try:
                   ftp.cwd("/")
               except Exception:
+                  # some servers disallow changing to root; continue from current dir
                   pass
               for part in parts:
                   try:
@@ -85,11 +85,28 @@ jobs:
                           ftp.mkd(part)
                           ftp.cwd(part)
                       except Exception as e:
-                          # Some servers behave differently; attempt to cwd again
+                          # attempt one more time to cwd; otherwise fail
                           try:
                               ftp.cwd(part)
                           except Exception:
                               raise RuntimeError(f"Failed to create or enter remote directory '{part}': {e}")
+
+          def remote_file_size(ftp: ftplib.FTP, filename: str):
+              """
+              Return remote file size in bytes if supported, otherwise None.
+              Assumes ftp current working directory is the directory containing filename.
+              """
+              try:
+                  sz = ftp.size(filename)
+                  if sz is None:
+                      return None
+                  return int(sz)
+              except ftplib.error_perm:
+                  # server denies SIZE or file not found
+                  return None
+              except Exception:
+                  # other errors (e.g., not supported)
+                  return None
 
           def upload_directory(ftp: ftplib.FTP, local_dir: str, remote_base: str = ""):
               local_dir = os.path.abspath(local_dir)
@@ -100,17 +117,44 @@ jobs:
                   else:
                       # normalize to POSIX path for FTP
                       remote_dir = "/".join(filter(None, [remote_base, rel.replace(os.sep, "/")]))
-                  # ensure remote dir exists and cwd into it
+
+                  # Ensure remote dir exists and cwd into it (if remote_dir empty, ensure_remote_dir will no-op)
                   ensure_remote_dir(ftp, remote_dir)
 
                   for filename in files:
                       local_path = os.path.join(root, filename)
+                      local_size = os.path.getsize(local_path)
+                      # Check remote file size (in current working directory)
+                      remote_sz = remote_file_size(ftp, filename)
+                      if remote_sz == local_size:
+                          print(f"Skipping {local_path} -> {remote_dir}/{filename} (already uploaded, sizes match: {local_size} bytes)")
+                          continue
+                      if remote_sz is not None and remote_sz > local_size:
+                          # remote file is larger than local (unexpected); overwrite
+                          print(f"Remote file {filename} is larger ({remote_sz} bytes) than local ({local_size} bytes); will overwrite.")
+                      else:
+                          if remote_sz is None:
+                              print(f"No remote size available for {filename}; will upload.")
+                          else:
+                              print(f"Remote file {filename} partial ({remote_sz}/{local_size} bytes); re-uploading to ensure completeness.")
+
+                      # Upload file
                       print(f"Uploading {local_path} -> {remote_dir}/{filename}")
                       with open(local_path, "rb") as fp:
                           try:
                               ftp.storbinary(f"STOR {filename}", fp)
                           except Exception as e:
                               raise RuntimeError(f"Failed to upload {local_path}: {e}")
+
+                      # Verify after upload: check remote size equals local size
+                      after_sz = remote_file_size(ftp, filename)
+                      if after_sz is None:
+                          # Server doesn't support SIZE; best-effort - we consider upload done
+                          print(f"Warning: server does not report size for {filename}; cannot verify completeness.")
+                      elif after_sz != local_size:
+                          raise RuntimeError(f"Upload verification failed for {filename}: local {local_size} bytes, remote {after_sz} bytes")
+                      else:
+                          print(f"Verified {filename}: {after_sz} bytes (matches local)")
 
           def main():
               # Clean start
