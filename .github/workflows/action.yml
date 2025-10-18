@@ -17,7 +17,7 @@ jobs:
           ZIP_NAME: "pD2ZOpEeq5.zip"
           EXTRACT_DIR: "extracted"
           FTP_HOST_PORT: "ftp.minefort.com:21"
-          FTP_USER: "RYLOU0gwZn"
+          FTP_USER: "CEBJxQ9wt5"
           FTP_PASS: "gQT90ExX3a"
           REMOTE_BASE_DIR: ""  # set a remote base path here if desired
         run: |
