@@ -4,108 +4,59 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'URL of the file to download'
+        description: 'URL (direct, magnet, tpb.party, or 1337x.to)'
         required: true
         type: string
 
 jobs:
   process-video:
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout the repository
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      # Set up Python
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      # Install ffmpeg, wget, and curl
-      - name: Install ffmpeg, wget, and curl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg wget curl
-
-      # Install Python dependencies (requests only, if needed elsewhere)
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      # Create a directory for downloads and converted files
+          sudo apt-get update && sudo apt-get install -y ffmpeg wget curl aria2
+          pip install requests beautifulsoup4
       - name: Create directories
-        run: |
-          mkdir -p downloads
-          mkdir -p converted
-
-      # Download file with curl (for header check) and wget (for download with progress bar)
+        run: mkdir -p downloads converted
       - name: Download file
         run: |
-          # Extract filename from URL
-          URL="${{ github.event.inputs.file_url }}"
-          FILENAME=$(basename "$URL")
-          OUTPUT_PATH="downloads/$FILENAME"
-
-          # Use curl to check if the URL is accessible with retries
-          echo "Checking URL accessibility with curl..."
-          curl --retry 3 --retry-delay 5 --head --fail --silent "$URL"
-          if [ $? -ne 0 ]; then
-            echo "Error: URL is not accessible or file does not exist."
-            exit 1
-          fi
-
-          # Use wget to download the file with progress bar
-          echo "Downloading file with wget..."
-          wget --progress=bar:force --output-document="$OUTPUT_PATH" "$URL"
-          if [ $? -ne 0 ]; then
-            echo "Error: Failed to download file with wget."
-            exit 1
-          fi
-
-      # Convert video files to 480p, rename, and delete originals
+          python -c "
+          import requests, os, subprocess, re
+          from bs4 import BeautifulSoup
+          url = '${{ github.event.inputs.file_url }}'.strip()
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+          if url.startswith('magnet:'):
+              subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', url], check=True)
+          elif 'tpb.party' in url.lower() or '1337x.to' in url.lower():
+              site = 'tpb.party' if 'tpb.party' in url.lower() else '1337x.to'
+              r = requests.get(url, headers={'User-Agent': ua}, timeout=10)
+              r.raise_for_status()
+              soup = BeautifulSoup(r.text, 'html.parser')
+              magnet = next((a['href'] for a in soup.find_all('a', href=lambda h: h and h.startswith('magnet:')), None) or \
+                       next((a['href'] for d in soup.find_all('div', class_=re.compile('download|magnet|torrent')) for a in d.find_all('a', href=lambda h: h and h.startswith('magnet:'))), None) or \
+                       next((a['href'] for a in soup.find_all('a', string=re.compile('get.*torrent|magnet' if site == 'tpb.party' else 'magnet.*download|download.*magnet', re.I)) if a.get('href', '').startswith('magnet:')), None)
+              if not magnet:
+                  with open('page.html', 'w') as f: f.write(soup.prettify())
+                  raise ValueError(f'No magnet link found on {site}')
+              subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', magnet], check=True)
+          else:
+              subprocess.run(['curl', '--retry', '3', '--head', '--fail', '--silent', '--user-agent', ua, url], check=True)
+              filename = url.split('/')[-1]
+              subprocess.run(['wget', '--progress=bar:force', f'--output-document=downloads/{filename}', '--user-agent', ua, url], check=True)
+          "
       - name: Convert videos to 480p
         run: |
           python -c "
-          import os
-          import subprocess
-          import glob
-
-          download_dir = 'downloads'
-          converted_dir = 'converted'
-
-          # Supported video extensions
-          video_extensions = ['*.mp4', '*.mkv', '*.avi', '*.mov', '*.flv', '*.wmv']
-
-          for ext in video_extensions:
-              for file_path in glob.glob(f'{download_dir}/{ext}'):
-                  filename = os.path.basename(file_path)
-                  # Replace spaces with dots
-                  new_filename = '480' + filename.replace(' ', '.')
-                  output_path = os.path.join(converted_dir, new_filename)
-
-                  # Convert video to 480p with automatic adjustments
-                  cmd = [
-                      'ffmpeg',
-                      '-i', file_path,
-                      '-vf', 'scale=-2:480',
-                      '-c:v', 'libx264',
-                      '-preset', 'medium',
-                      '-crf', '23',
-                      '-c:a', 'aac',
-                      '-b:a', '128k',
-                      '-y',  # Overwrite output files without asking
-                      output_path
-                  ]
-                  subprocess.run(cmd, check=True)
-                  
-                  # Delete original file
-                  os.remove(file_path)
+          import glob, os, subprocess
+          for f in glob.glob('downloads/**/*.mp4', recursive=True) + glob.glob('downloads/**/*.{mkv,avi,mov,flv,wmv}', recursive=True):
+              out = f'converted/480{os.path.basename(f).replace(' ', '.')}'
+              subprocess.run(['ffmpeg', '-i', f, '-vf', 'scale=-2:480', '-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-y', out], check=True)
+              os.remove(f)
           "
-
-      # Create a release and upload converted files
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -114,10 +65,6 @@ jobs:
         with:
           tag_name: latest
           release_name: Latest Release
-          draft: false
-          prerelease: false
-
-      # Upload converted files to the release
       - name: Upload Release Assets
         uses: actions/upload-release-asset@v1
         env:
@@ -127,8 +74,5 @@ jobs:
           asset_path: converted/*
           asset_name: '*.mp4,*.mkv,*.avi,*.mov,*.flv,*.wmv'
           asset_content_type: video/*
-
-      # Clean up directories
       - name: Clean up
-        run: |
-          rm -rf downloads converted
+        run: rm -rf downloads converted
