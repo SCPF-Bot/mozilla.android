@@ -49,12 +49,11 @@ jobs:
       continue-on-error: false
 
     - name: Upload ReVanced Applications
-      if: inputs.UPLOAD
-      uses: termux/upload-release-action@master
+      uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
         release_name: "${{ github.run_id }}"
-        tag: "${{ env.MAIN_TAG }}"
+        tag: "latest"
         checksums: sha256
         file: files/*
         overwrite: true
