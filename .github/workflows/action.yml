@@ -58,5 +58,5 @@ jobs:
       run: |
         gh release delete latest --yes || true
         git push origin :latest || true
-        FILES=$(ls files/* | grep -v -e download.py -e url.txt)
+        FILES=$(ls files/* | grep -v -e download.py -e url.txt -e url.txt -e readme.md)
         gh release create latest $FILES --title "Latest Downloads" --notes "${{ steps.notes.outputs.notes }}"
