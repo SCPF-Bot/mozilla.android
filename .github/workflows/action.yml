@@ -4,17 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL, magnet link, torrent link, or .txt file with links'
+        description: 'URL, magnet, torrent link, or .txt file URL to download'
         required: true
-        type: string
       compress:
-        description: 'Compress applicable files (e.g., videos to 480p, images reduced size, APK images compressed)'
-        required: false
+        description: 'Compress applicable files (e.g., videos to 480p, images, audio)'
         type: boolean
         default: false
       archive:
-        description: 'Archive each file individually with maximum compression (7z)'
-        required: false
+        description: 'Archive each file individually with maximum compression'
         type: boolean
         default: false
 
@@ -22,38 +19,44 @@ jobs:
   download:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-      - name: Install Chrome
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget curl aria2 ffmpeg p7zip-full chromium-chromedriver
 
-      - name: Set up Chromedriver
-        uses: nanasess/setup-chromedriver@v2
+    - name: Install Python dependencies
+      run: |
+        pip install selenium requests pillow beautifulsoup4 python-magic
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y aria2 ffmpeg p7zip-full curl wget
-          pip install requests beautifulsoup4 fake-useragent pillow selenium
+    - name: Run download script
+      run: python download.py "${{ github.event.inputs.url }}" ${{ github.event.inputs.compress }} ${{ github.event.inputs.archive }}
 
-      - name: Run download script
-        run: python download.py "${{ inputs.url }}" ${{ inputs.compress }} ${{ inputs.archive }}
-
-      - name: Create or update release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          release=$(gh release view latest --json id -q .id 2>/dev/null || echo "")
-          if [ -z "$release" ]; then
-            gh release create latest --title "Latest Downloads" -F notes.md
-          else
-            gh release edit latest --title "Latest Downloads" -F notes.md
+    - name: Prepare release notes
+      id: notes
+      run: |
+        NOTES="Downloaded files:\n"
+        for file in files/*; do
+          if [ -f "$file" ] && [ "$(basename "$file")" != "download.py" ] && [ "$(basename "$file")" != "url.txt" ]; then
+            filename=$(basename "$file")
+            NOTES="$NOTES- https://github.com/${{ github.repository }}/releases/download/latest/$filename\n"
           fi
-          gh release upload latest files/* --clobber
+        done
+        echo "notes<<EOF" >> $GITHUB_OUTPUT
+        echo "$NOTES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create or update latest release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release delete latest --yes || true
+        git push origin :latest || true
+        FILES=$(ls files/* | grep -v -e download.py -e url.txt)
+        gh release create latest $FILES --title "Latest Downloads" --notes "${{ steps.notes.outputs.notes }}"
