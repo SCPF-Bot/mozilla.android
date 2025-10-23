@@ -1,0 +1,182 @@
+name: Release Latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      BUILD:
+        description: "Build Packages"
+        type: boolean
+        default: true
+
+      SIGN:
+        description: "Sign Packages"
+        type: boolean
+        default: true
+
+      ARCHIVE-PACKAGES:
+        description: "Archive Packages"
+        type: boolean
+        default: false
+
+      UPLOAD:
+        description: "Upload Packages"
+        type: boolean
+        default: true
+
+jobs:
+  Start:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Setup Checkout
+      uses: actions/checkout@main
+
+    - name: Setup Java
+      uses: actions/setup-java@main
+      with:
+        distribution: "zulu"
+        java-version: "17"
+        java-package: jdk
+
+    - name: Prerequisites
+      run: |
+        HOMEDIR="/"$(pwd)
+        echo "MAIN_TAG=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
+        cd revanced/assets/temp && chmod +x download.prerequisites.sh && ./download.prerequisites.sh && cd $HOMEDIR
+        cd revanced && chmod +x copy.latest.files.sh && ./copy.latest.files.sh
+
+    - name: Patch Backdrops
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/backdrops
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch Citra Emulator
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/citra.emulator
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch Hexedit
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/hexedit
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch Icon Pack Studio
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/icon.pack.studio
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Download Instagram
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/instagram
+        chmod +x download.sh && ./download.sh
+
+    - name: Download Micro G
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/microg
+        chmod +x download.sh && ./download.sh
+
+    - name: Patch Nova Launcher
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/nova.launcher
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch Nyx Music Player
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/nyx.music.player
+        cd 64.v8a && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd v7a && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd x86.64 && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd x86 && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+
+    - name: Patch Reddit
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/reddit
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Download ReVanced Manager
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/revanced.manager
+        chmod +x download.sh && ./download.sh
+
+    - name: Patch Spotify
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/spotify
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch TickTick
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/ticktick
+        cd 64.v8a && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd v7a && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd x86.64 && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd x86 && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+
+    - name: Patch TikTok
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/tiktok
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch Twitch
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/twitch
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch Twitter
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/twitter
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Patch YouTube Music
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/youtube.music
+        cd 64.v8a && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd v7a && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd x86.64 && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+        cd x86 && chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental && cd ..
+
+    - name: Patch YouTube
+      if: inputs.BUILD
+      run: |
+        cd revanced/packages/youtube
+        chmod +x download.sh && ./download.sh && chmod +x compile.sh && ./compile.sh experimental
+
+    - name: Sign Packages
+      if: inputs.SIGN
+      run: |
+        cd revanced
+        chmod +x sign.sh && ./sign.sh
+
+    - name: Archive Packages
+      if: inputs.ARCHIVE-PACKAGES
+      run: |
+        cd revanced
+        chmod +x 7z.sh && ./7z.sh
+
+    - name: Upload ReVanced Applications
+      if: inputs.UPLOAD
+      uses: termux/upload-release-action@master
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        release_name: "${{ github.run_id }}"
+        tag: "${{ env.MAIN_TAG }}"
+        checksums: sha256
+        file: revanced/release/*
+        overwrite: true
+        file_glob: true
+        prerelease: false
