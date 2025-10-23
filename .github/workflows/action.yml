@@ -54,7 +54,6 @@ jobs:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
         release_name: "${{ github.run_id }}"
         tag: "latest"
-        checksums: sha256
         file: files/*
         overwrite: true
         file_glob: true
