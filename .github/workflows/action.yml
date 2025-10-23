@@ -7,74 +7,226 @@ on:
         description: 'URL of the file or torrent page to download (supports direct URLs, magnet links, or torrent detail pages from various sites)'
         required: true
         type: string
+      archive:
+        description: 'Create a compact archive per converted file (checkbox). If checked, each converted file will be archived individually using 7z maximum compression before upload.'
+        required: false
+        type: boolean
+        default: 'false'
+
+concurrency:
+  group: download-convert-480p
+  cancel-in-progress: false
 
 jobs:
   process-video:
     runs-on: ubuntu-latest
+    env:
+      FILE_URL: ${{ github.event.inputs.file_url }}
+      ARCHIVE: ${{ github.event.inputs.archive }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg wget curl aria2
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg wget curl aria2 p7zip-full jq
+          python -m pip install --upgrade pip
           pip install requests beautifulsoup4
+
       - name: Create directories
-        run: mkdir -p downloads converted
+        run: mkdir -p downloads converted archives
+
       - name: Download file
         run: |
-          python -c "
-          import requests, os, subprocess, re
+          set -euo pipefail
+          if [ -z "${FILE_URL:-}" ]; then
+            echo "No file_url provided; exiting early."
+            exit 0
+          fi
+          python - <<'PY'
+          import os, subprocess, requests, sys
           from bs4 import BeautifulSoup
-          url = '${{ github.event.inputs.file_url }}'.strip()
+
+          url = os.getenv('FILE_URL', '').strip()
           ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
-          if url.startswith('magnet:'):
-              subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', url], check=True)
-          else:
-              head_r = requests.head(url, headers={'User-Agent': ua}, timeout=10, allow_redirects=True)
-              content_type = head_r.headers.get('Content-Type', '').lower()
-              if 'text/html' in content_type:
-                  r = requests.get(url, headers={'User-Agent': ua}, timeout=10)
-                  r.raise_for_status()
-                  soup = BeautifulSoup(r.text, 'html.parser')
-                  magnet = next((a['href'] for a in soup.find_all('a', href=lambda h: h and h.startswith('magnet:')), None) or \
-                           next((a['href'] for d in soup.find_all('div', class_=re.compile('download|magnet|torrent')) for a in d.find_all('a', href=lambda h: h and h.startswith('magnet:'))), None) or \
-                           next((a['href'] for a in soup.find_all('a', string=re.compile('magnet|download|torrent|get.*torrent', re.I)) if a.get('href', '').startswith('magnet:')), None)
-                  if not magnet:
-                      with open('page.html', 'w') as f: f.write(soup.prettify())
-                      raise ValueError('No magnet link found on the page')
-                  subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', magnet], check=True)
+          if not url:
+              print("Empty URL; nothing to do.")
+              sys.exit(0)
+
+          def run(cmd):
+              print("RUN:", " ".join(cmd))
+              subprocess.run(cmd, check=True)
+
+          try:
+              if url.startswith('magnet:'):
+                  run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', url])
               else:
-                  subprocess.run(['curl', '--retry', '3', '--head', '--fail', '--silent', '--user-agent', ua, url], check=True)
-                  filename = url.split('/')[-1]
-                  subprocess.run(['wget', '--progress=bar:force', f'--output-document=downloads/{filename}', '--user-agent', ua, url], check=True)
-          "
+                  # Try HEAD to see content-type
+                  try:
+                      head = requests.head(url, headers={'User-Agent': ua}, timeout=15, allow_redirects=True)
+                      content_type = head.headers.get('Content-Type', '').lower()
+                  except Exception:
+                      content_type = ''
+                  if 'text/html' in content_type or url.endswith('.html') or url.endswith('/'):
+                      r = requests.get(url, headers={'User-Agent': ua}, timeout=20)
+                      r.raise_for_status()
+                      soup = BeautifulSoup(r.text, 'html.parser')
+                      # try to find magnet first
+                      magnet = None
+                      for a in soup.find_all('a', href=True):
+                          if a['href'].startswith('magnet:'):
+                              magnet = a['href']
+                              break
+                      if magnet:
+                          run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', magnet])
+                      else:
+                          # try to find direct file links (common extensions)
+                          exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.torrent', '.ts', '.mpg', '.mpeg')
+                          dl = None
+                          for a in soup.find_all('a', href=True):
+                              h = a['href']
+                              if h.startswith('http') and h.lower().endswith(exts):
+                                  dl = h
+                                  break
+                          if dl:
+                              run(['wget', '--progress=dot:giga', '--user-agent', ua, '--directory-prefix=downloads', dl])
+                          else:
+                              with open('page.html', 'w', encoding='utf-8') as f:
+                                  f.write(soup.prettify())
+                              raise ValueError("No magnet or direct downloadable file link found; saved page.html for inspection.")
+                  else:
+                      # treat as direct file
+                      filename = url.split('/')[-1] or 'downloaded_file'
+                      filename = filename.replace(' ', '_')
+                      run(['wget', '--progress=dot:giga', '--user-agent', ua, '--directory-prefix=downloads', '-O', f'downloads/{filename}', url])
+          except subprocess.CalledProcessError as e:
+              print("External command failed:", e)
+              raise
+          except Exception as e:
+              print("Download error:", e)
+              raise
+          PY
+
       - name: Convert videos to 480p
         run: |
-          python -c "
+          set -euo pipefail
+          python - <<'PY'
           import glob, os, subprocess
-          for f in glob.glob('downloads/**/*.mp4', recursive=True) + glob.glob('downloads/**/*.{mkv,avi,mov,flv,wmv}', recursive=True):
-              out = f'converted/480{os.path.basename(f).replace(' ', '.')}'
-              subprocess.run(['ffmpeg', '-i', f, '-vf', 'scale=-2:480', '-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-y', out], check=True)
-              os.remove(f)
-          "
+          exts = ['mp4','mkv','avi','mov','flv','wmv','webm','ts','mpg','mpeg']
+          os.makedirs('converted', exist_ok=True)
+          found = False
+          for ext in exts:
+              for f in glob.glob(f'downloads/**/*.{ext}', recursive=True):
+                  found = True
+                  base = os.path.splitext(os.path.basename(f))[0]
+                  safe_base = "".join(c if (c.isalnum() or c in ('-','_')) else '_' for c in base)[:200]
+                  out = os.path.join('converted', f'480_{safe_base}.mp4')
+                  cmd = [
+                    'ffmpeg','-hide_banner','-y','-i', f,
+                    '-vf', 'scale=-2:480',
+                    '-c:v', 'libx264', '-preset', 'slow', '-crf', '23',
+                    '-c:a', 'aac', '-b:a', '128k', out
+                  ]
+                  try:
+                      print("Converting:", f, "->", out)
+                      subprocess.run(cmd, check=True)
+                      try:
+                          os.remove(f)
+                      except OSError:
+                          pass
+                  except subprocess.CalledProcessError as e:
+                      print("ffmpeg failed for", f, e)
+          if not found:
+              print("No video files found to convert in downloads/ (extensions: {})".format(", ".join(exts)))
+          PY
+
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: latest
           release_name: Latest Release
-      - name: Upload Release Assets
-        uses: actions/upload-release-asset@v1
+          body: "Automated release created by workflow"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: converted/*
-          asset_name: '*.mp4,*.mkv,*.avi,*.mov,*.flv,*.wmv'
-          asset_content_type: video/*
+
+      - name: Archive files individually (optional)
+        if: ${{ github.event.inputs.archive == 'true' }}
+        run: |
+          set -euo pipefail
+          mkdir -p archives
+          shopt -s nullglob
+          for f in converted/*; do
+            [ -f "$f" ] || continue
+            fname="$(basename "$f")"
+            # Using 7z LZMA2 maximum settings with multi-threading and large dictionary for better compression on large files:
+            # -t7z : 7z archive
+            # -m0=lzma2 : LZMA2
+            # -mx=9 : max compression
+            # -mfb=64 -md=128m : tune for better ratio (md=128m dictionary, adjust if runner memory constrained)
+            # -mmt=on : multi-thread
+            7z a -t7z -m0=lzma2 -mx=9 -mfb=64 -md=128m -mmt=on "archives/${fname}.7z" "$f" >/dev/null
+            if [ -f "archives/${fname}.7z" ]; then
+              rm -f "$f"
+            else
+              echo "Archive creation failed for $f" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload Release Assets
+        run: |
+          set -euo pipefail
+          upload_url="${{ steps.create_release.outputs.upload_url }}"
+          if [ -z "$upload_url" ]; then
+            echo "No upload URL obtained from create-release step; skipping upload."
+            exit 0
+          fi
+          # strip the template part if present
+          upload_url="${upload_url%%\{*}"
+
+          # decide which directory to upload from
+          DIR="converted"
+          if [ "${{ github.event.inputs.archive }}" = "true" ] && [ -d "archives" ] && [ "$(ls -A archives || true)" != "" ]; then
+            DIR="archives"
+          fi
+
+          if [ ! -d "$DIR" ] || [ "$(ls -A "$DIR" || true)" = "" ]; then
+            echo "No files to upload in $DIR; nothing to do."
+            exit 0
+          fi
+
+          for f in "$DIR"/*; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            echo "Uploading $fname ..."
+            # use curl to upload each asset (retry, small delay)
+            for i in 1 2 3; do
+              if curl --fail -sS -X POST \
+                  -H "Authorization: token $GITHUB_TOKEN" \
+                  -H "Content-Type: application/octet-stream" \
+                  --data-binary @"$f" \
+                  "$upload_url?name=$(python -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$fname")"; then
+                echo "Uploaded $fname"
+                break
+              else
+                echo "Upload attempt $i failed for $fname"
+                sleep $((i * 5))
+              fi
+              if [ "$i" = 3 ]; then
+                echo "Failed to upload $fname after 3 attempts" >&2
+                exit 1
+              fi
+            done
+          done
+
       - name: Clean up
-        run: rm -rf downloads converted
+        if: always()
+        run: |
+          rm -rf downloads converted archives || true
