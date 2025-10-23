@@ -7,6 +7,11 @@ on:
         description: 'URL of the file or torrent page to download (supports direct URLs, magnet links, or torrent detail pages from various sites)'
         required: true
         type: string
+      convert:
+        description: 'Convert downloaded videos to 480p (checkbox). If checked, the conversion step will run.'
+        required: false
+        type: boolean
+        default: 'false'
       archive:
         description: 'Create a compact archive per converted file (checkbox). If checked, each converted file will be archived individually using 7z maximum compression before upload.'
         required: false
@@ -22,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FILE_URL: ${{ github.event.inputs.file_url }}
+      CONVERT: ${{ github.event.inputs.convert }}
       ARCHIVE: ${{ github.event.inputs.archive }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -124,7 +130,9 @@ jobs:
 
           def choose_filename(resp, url):
               # Prefer Content-Disposition, then URL path last segment
-              cd = resp.headers.get('content-disposition') or resp.headers.get('Content-Disposition')
+              cd = None
+              if resp is not None:
+                  cd = resp.headers.get('content-disposition') or resp.headers.get('Content-Disposition')
               fname = filename_from_cd(cd)
               if not fname:
                   path = urlparse(url).path
@@ -134,7 +142,9 @@ jobs:
               # sanitize and ensure extension
               if fname:
                   fname = sanitize_name(fname)
-              ct = resp.headers.get('content-type', '')
+              ct = ''
+              if resp is not None:
+                  ct = resp.headers.get('content-type', '')
               ext = os.path.splitext(fname or '')[1].lower() if fname and '.' in fname else ''
               if not ext:
                   guessed = ext_from_ct(ct)
@@ -163,7 +173,7 @@ jobs:
           try:
               if url.startswith('magnet:'):
                   print("Magnet link detected; using aria2c")
-                  run(['aria2c', '--dir=' + DOWNLOAD_DIR, '--seed-time=0', '--summary-interval=10', url])
+                  run(['aria2c', '--dir=' + DOWNLOAD_DIR, '--seed-time=0', '--summary-interval=10', '--max-concurrent-downloads=1', url])
               else:
                   # Try HEAD first
                   try:
@@ -189,7 +199,7 @@ jobs:
                               break
                       if magnet:
                           print("Found magnet on page:", magnet)
-                          run(['aria2c', '--dir=' + DOWNLOAD_DIR, '--seed-time=0', '--summary-interval=10', magnet])
+                          run(['aria2c', '--dir=' + DOWNLOAD_DIR, '--seed-time=0', '--summary-interval=10', '--max-concurrent-downloads=1', magnet])
                       else:
                           # look for direct downloadable links
                           dl = None
@@ -209,7 +219,10 @@ jobs:
                           if dl:
                               print("Found downloadable link:", dl)
                               # HEAD the discovered link to determine filename
-                              resp = requests.head(dl, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                              try:
+                                  resp = requests.head(dl, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                              except Exception:
+                                  resp = None
                               fname = choose_filename(resp, dl)
                               out = os.path.join(DOWNLOAD_DIR, fname)
                               # download via streaming
@@ -220,7 +233,10 @@ jobs:
                               raise ValueError("No magnet or direct downloadable file link found; saved page.html for inspection.")
                   else:
                       # treat as direct file link
-                      resp = requests.head(url, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                      try:
+                          resp = requests.head(url, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                      except Exception:
+                          resp = None
                       fname = choose_filename(resp, url)
                       out = os.path.join(DOWNLOAD_DIR, fname)
                       download_stream(url, out)
@@ -270,7 +286,8 @@ jobs:
           print("Download step complete.")
           PY
 
-      - name: Convert videos to 480p
+      - name: Convert videos to 480p (manual activation)
+        if: ${{ github.event.inputs.convert == 'true' }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -308,15 +325,34 @@ jobs:
               print("No video files found to convert in downloads/ (extensions: {})".format(", ".join(exts)))
           PY
 
-      - name: Create Release
+      - name: Create or get release (handles existing tag)
         id: create_release
-        uses: actions/create-release@v1
-        with:
-          tag_name: latest
-          release_name: Latest Release
-          body: "Automated release created by workflow"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="latest"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          # Try to get an existing release by tag
+          resp=$(curl -sS -H "Authorization: token ${GITHUB_TOKEN}" "${API}/releases/tags/${TAG}" || true)
+          upload_url=$(echo "$resp" | jq -r '.upload_url // empty')
+          if [ -n "$upload_url" ]; then
+            echo "Found existing release for tag ${TAG}"
+          else
+            echo "No existing release for tag ${TAG}; creating a new release."
+            create_resp=$(curl -sS -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"${TAG}\",\"name\":\"Latest Release\",\"body\":\"Automated release created by workflow\",\"draft\":false,\"prerelease\":false}" \
+              "${API}/releases")
+            upload_url=$(echo "$create_resp" | jq -r '.upload_url // empty')
+            if [ -z "$upload_url" ]; then
+              echo "Failed to create release. Response: $create_resp" >&2
+              exit 1
+            fi
+            echo "Created release for tag ${TAG}"
+          fi
+          # Strip template part if present
+          upload_url=${upload_url%%\{*}
+          echo "upload_url=${upload_url}" >> "$GITHUB_OUTPUT"
 
       - name: Archive files individually (optional)
         if: ${{ github.event.inputs.archive == 'true' }}
@@ -350,8 +386,6 @@ jobs:
             echo "No upload URL obtained from create-release step; skipping upload."
             exit 0
           fi
-          # strip the template part if present
-          upload_url="${upload_url%%\{*}"
 
           # decide which directory to upload from
           DIR="converted"
