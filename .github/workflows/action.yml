@@ -23,17 +23,17 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Install ffmpeg
-      - name: Install ffmpeg
+      # Install ffmpeg, wget, and curl
+      - name: Install ffmpeg, wget, and curl
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg wget curl
 
-      # Install Python dependencies
+      # Install Python dependencies (requests only, if needed elsewhere)
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests tqdm
+          pip install requests
 
       # Create a directory for downloads and converted files
       - name: Create directories
@@ -41,29 +41,29 @@ jobs:
           mkdir -p downloads
           mkdir -p converted
 
-      # Download file with progress bar
+      # Download file with curl (for header check) and wget (for download with progress bar)
       - name: Download file
         run: |
-          python -c "
-          import requests
-          from tqdm import tqdm
-          import os
+          # Extract filename from URL
+          URL="${{ github.event.inputs.file_url }}"
+          FILENAME=$(basename "$URL")
+          OUTPUT_PATH="downloads/$FILENAME"
 
-          url = '${{ github.event.inputs.file_url }}'
-          filename = url.split('/')[-1]
-          output_path = f'downloads/{filename}'
+          # Use curl to check if the URL is accessible with retries
+          echo "Checking URL accessibility with curl..."
+          curl --retry 3 --retry-delay 5 --head --fail --silent "$URL"
+          if [ $? -ne 0 ]; then
+            echo "Error: URL is not accessible or file does not exist."
+            exit 1
+          fi
 
-          response = requests.get(url, stream=True)
-          total_size = int(response.headers.get('content-length', 0))
-          
-          # Download with progress bar
-          with tqdm(total=total_size, unit='B', unit_scale=True, desc=filename) as progress:
-              with open(output_path, 'wb') as f:
-                  for chunk in response.iter_content(chunk_size=8192):
-                      if chunk:
-                          f.write(chunk)
-                          progress.update(len(chunk))
-          "
+          # Use wget to download the file with progress bar
+          echo "Downloading file with wget..."
+          wget --progress=bar:force --output-document="$OUTPUT_PATH" "$URL"
+          if [ $? -ne 0 ]; then
+            echo "Error: Failed to download file with wget."
+            exit 1
+          fi
 
       # Convert video files to 480p, rename, and delete originals
       - name: Convert videos to 480p
