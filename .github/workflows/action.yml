@@ -1,4 +1,4 @@
-name: Download and Convert Video to 480p
+name: Downloader
 
 on:
   workflow_dispatch:
@@ -35,14 +35,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg wget curl aria2 p7zip-full jq
+          sudo apt-get install -y ffmpeg wget curl aria2 p7zip-full jq file
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
       - name: Create directories
         run: mkdir -p downloads converted archives
 
-      - name: Download file
+      - name: Download file (detect filename & type before saving)
         run: |
           set -euo pipefail
           if [ -z "${FILE_URL:-}" ]; then
@@ -50,67 +50,224 @@ jobs:
             exit 0
           fi
           python - <<'PY'
-          import os, subprocess, requests, sys
+          """
+          Enhanced downloader:
+          - Detects filename from Content-Disposition header or URL path before saving
+          - Uses Content-Type to ensure correct extension when missing
+          - Parses HTML pages to find magnet links or direct file links
+          - Uses aria2c for magnet: and .torrent downloads (keeps aria2c for bittorrent support)
+          - After aria2c completes, normalizes filenames in downloads/
+          """
+          import os, sys, subprocess, re, requests, shutil
+          from urllib.parse import urlparse, unquote, urljoin
           from bs4 import BeautifulSoup
 
-          url = os.getenv('FILE_URL', '').strip()
           ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
-          if not url:
-              print("Empty URL; nothing to do.")
-              sys.exit(0)
+          url = os.getenv('FILE_URL', '').strip()
+          DOWNLOAD_DIR = 'downloads'
+          os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+          common_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.torrent', '.ts', '.mpg', '.mpeg', '.ogv', '.m4v')
 
           def run(cmd):
               print("RUN:", " ".join(cmd))
               subprocess.run(cmd, check=True)
 
+          def sanitize_name(name):
+              # Keep Unicode but replace troublesome chars
+              name = name.strip()
+              name = name.replace('/', '_').replace('\\', '_')
+              name = re.sub(r'[\x00-\x1f<>:"|?*]+', '_', name)
+              return name[:240]
+
+          def filename_from_cd(cd):
+              # Content-Disposition parsing (very simple)
+              if not cd:
+                  return None
+              m = re.search(r'filename\*=(?:UTF-8\'\')?([^;]+)', cd)
+              if m:
+                  fn = m.group(1)
+                  try:
+                      fn = unquote(fn)
+                  except Exception:
+                      pass
+                  return fn.strip('"')
+              m = re.search(r'filename=\"?([^\";]+)\"?', cd)
+              if m:
+                  return m.group(1)
+              return None
+
+          def ext_from_ct(ct):
+              if not ct:
+                  return None
+              ct = ct.split(';',1)[0].strip().lower()
+              # basic mapping for common video types
+              mapping = {
+                  'video/mp4': '.mp4',
+                  'video/x-matroska': '.mkv',
+                  'video/webm': '.webm',
+                  'video/quicktime': '.mov',
+                  'video/x-msvideo': '.avi',
+                  'video/x-flv': '.flv',
+                  'video/mpeg': '.mpg',
+                  'application/x-bittorrent': '.torrent',
+                  'application/octet-stream': None
+              }
+              if ct in mapping:
+                  return mapping[ct]
+              # fallback: try simple suffix from subtype
+              parts = ct.split('/')
+              if len(parts) == 2:
+                  sub = parts[1].split('+')[0].split('.')[0]
+                  return '.' + sub
+              return None
+
+          def choose_filename(resp, url):
+              # Prefer Content-Disposition, then URL path last segment
+              cd = resp.headers.get('content-disposition') or resp.headers.get('Content-Disposition')
+              fname = filename_from_cd(cd)
+              if not fname:
+                  path = urlparse(url).path
+                  fname = os.path.basename(path) or None
+                  if fname:
+                      fname = unquote(fname)
+              # sanitize and ensure extension
+              if fname:
+                  fname = sanitize_name(fname)
+              ct = resp.headers.get('content-type', '')
+              ext = os.path.splitext(fname or '')[1].lower() if fname and '.' in fname else ''
+              if not ext:
+                  guessed = ext_from_ct(ct)
+                  if guessed:
+                      if not fname:
+                          fname = 'downloaded_file' + guessed
+                      else:
+                          fname = fname + guessed
+              if not fname:
+                  # fallback generic name
+                  fname = 'downloaded_file'
+                  guessed = ext_from_ct(ct)
+                  if guessed:
+                      fname += guessed
+              return fname
+
+          def download_stream(url, out_path):
+              print("Downloading:", url, "->", out_path)
+              with requests.get(url, headers={'User-Agent': ua}, stream=True, timeout=60) as r:
+                  r.raise_for_status()
+                  with open(out_path, 'wb') as f:
+                      for chunk in r.iter_content(chunk_size=1024*1024):
+                          if chunk:
+                              f.write(chunk)
+
           try:
               if url.startswith('magnet:'):
-                  run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', url])
+                  print("Magnet link detected; using aria2c")
+                  run(['aria2c', '--dir=' + DOWNLOAD_DIR, '--seed-time=0', '--summary-interval=10', url])
               else:
-                  # Try HEAD to see content-type
+                  # Try HEAD first
                   try:
-                      head = requests.head(url, headers={'User-Agent': ua}, timeout=15, allow_redirects=True)
-                      content_type = head.headers.get('Content-Type', '').lower()
-                  except Exception:
-                      content_type = ''
-                  if 'text/html' in content_type or url.endswith('.html') or url.endswith('/'):
-                      r = requests.get(url, headers={'User-Agent': ua}, timeout=20)
+                      head = requests.head(url, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                      ct = head.headers.get('content-type','').lower()
+                  except Exception as e:
+                      print("HEAD failed:", e)
+                      head = None
+                      ct = ''
+
+                  # If HTML, fetch page and parse
+                  if 'text/html' in ct or url.endswith('.html') or url.endswith('/') or head is None:
+                      print("Treating as HTML page; fetching for links")
+                      r = requests.get(url, headers={'User-Agent': ua}, timeout=30)
                       r.raise_for_status()
                       soup = BeautifulSoup(r.text, 'html.parser')
-                      # try to find magnet first
+
+                      # Prefer magnet links
                       magnet = None
                       for a in soup.find_all('a', href=True):
                           if a['href'].startswith('magnet:'):
                               magnet = a['href']
                               break
                       if magnet:
-                          run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', magnet])
+                          print("Found magnet on page:", magnet)
+                          run(['aria2c', '--dir=' + DOWNLOAD_DIR, '--seed-time=0', '--summary-interval=10', magnet])
                       else:
-                          # try to find direct file links (common extensions)
-                          exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.torrent', '.ts', '.mpg', '.mpeg')
+                          # look for direct downloadable links
                           dl = None
                           for a in soup.find_all('a', href=True):
                               h = a['href']
-                              if h.startswith('http') and h.lower().endswith(exts):
-                                  dl = h
+                              full = urljoin(url, h)
+                              if full.lower().endswith(common_exts) or 'download' in full.lower():
+                                  dl = full
                                   break
+                          if not dl:
+                              # as a last resort, look for <video> sources
+                              v = soup.find('video')
+                              if v:
+                                  src = v.get('src')
+                                  if src:
+                                      dl = urljoin(url, src)
                           if dl:
-                              run(['wget', '--progress=dot:giga', '--user-agent', ua, '--directory-prefix=downloads', dl])
+                              print("Found downloadable link:", dl)
+                              # HEAD the discovered link to determine filename
+                              resp = requests.head(dl, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                              fname = choose_filename(resp, dl)
+                              out = os.path.join(DOWNLOAD_DIR, fname)
+                              # download via streaming
+                              download_stream(dl, out)
                           else:
                               with open('page.html', 'w', encoding='utf-8') as f:
                                   f.write(soup.prettify())
                               raise ValueError("No magnet or direct downloadable file link found; saved page.html for inspection.")
                   else:
-                      # treat as direct file
-                      filename = url.split('/')[-1] or 'downloaded_file'
-                      filename = filename.replace(' ', '_')
-                      run(['wget', '--progress=dot:giga', '--user-agent', ua, '--directory-prefix=downloads', '-O', f'downloads/{filename}', url])
+                      # treat as direct file link
+                      resp = requests.head(url, headers={'User-Agent': ua}, allow_redirects=True, timeout=20)
+                      fname = choose_filename(resp, url)
+                      out = os.path.join(DOWNLOAD_DIR, fname)
+                      download_stream(url, out)
           except subprocess.CalledProcessError as e:
               print("External command failed:", e)
               raise
           except Exception as e:
               print("Download error:", e)
               raise
+
+          # Post-process downloads: ensure files have reasonable extensions based on ffprobe if possible
+          def fix_extensions():
+              mapping = {
+                  'matroska': '.mkv',
+                  'mov,mp4,m4a,3gp,3g2,mj2': '.mp4',
+                  'mp4': '.mp4',
+                  'mpegts': '.ts',
+                  'mpeg': '.mpg',
+                  'avi': '.avi',
+                  'flv': '.flv',
+                  'webm': '.webm',
+                  'ogg': '.ogv'
+              }
+              for root, dirs, files in os.walk(DOWNLOAD_DIR):
+                  for fn in files:
+                      path = os.path.join(root, fn)
+                      base, ext = os.path.splitext(fn)
+                      # if file has extension that looks wrong (.bin, .tmp, etc.) or no extension, try probe
+                      if ext.lower() in ('', '.bin', '.tmp', '.download', '.part'):
+                          try:
+                              cmd = ['ffprobe','-v','error','-show_entries','format=format_name','-of','default=noprint_wrappers=1:nokey=1', path]
+                              out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+                              if out:
+                                  for k,v in mapping.items():
+                                      if out.startswith(k.split(',')[0]) or out in k.split(','):
+                                          new = base + v
+                                          newpath = os.path.join(root, new)
+                                          if not os.path.exists(newpath):
+                                              print("Renaming", path, "->", newpath)
+                                              os.rename(path, newpath)
+                                              path = newpath
+                                              break
+                          except Exception:
+                              pass
+
+          fix_extensions()
+          print("Download step complete.")
           PY
 
       - name: Convert videos to 480p
@@ -118,14 +275,19 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import glob, os, subprocess
-          exts = ['mp4','mkv','avi','mov','flv','wmv','webm','ts','mpg','mpeg']
+          exts = ['mp4','mkv','avi','mov','flv','wmv','webm','ts','mpg','mpeg','ogv','m4v']
           os.makedirs('converted', exist_ok=True)
           found = False
           for ext in exts:
               for f in glob.glob(f'downloads/**/*.{ext}', recursive=True):
                   found = True
-                  base = os.path.splitext(os.path.basename(f))[0]
-                  safe_base = "".join(c if (c.isalnum() or c in ('-','_')) else '_' for c in base)[:200]
+                  # preserve original base filename when making output
+                  orig = os.path.basename(f)
+                  base = os.path.splitext(orig)[0]
+                  # sanitize base for output filename
+                  safe_base = "".join(c if (c.isalnum() or c in ('-','_',' ')) else '_' for c in base)[:200]
+                  # trim trailing spaces and replace multiple spaces with single underscore
+                  safe_base = "_".join(safe_base.strip().split())
                   out = os.path.join('converted', f'480_{safe_base}.mp4')
                   cmd = [
                     'ffmpeg','-hide_banner','-y','-i', f,
