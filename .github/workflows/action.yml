@@ -355,7 +355,7 @@ jobs:
           echo "upload_url=${upload_url}" >> "$GITHUB_OUTPUT"
 
       - name: Archive files individually (optional)
-        if: ${{ github.event.inputs.archive == 'true' }}
+        if: ${{ github.event.inputs.archive == 'true' && github.event.inputs.convert == 'true' }}
         run: |
           set -euo pipefail
           mkdir -p archives
@@ -387,22 +387,32 @@ jobs:
             exit 0
           fi
 
-          # decide which directory to upload from
-          DIR="converted"
+          # Determine which directory to upload from:
+          # Priority:
+          # 1) archives (if archive requested and archives dir has files)
+          # 2) converted (if conversion ran and has files)
+          # 3) downloads (fallback: upload the original downloaded files)
+          DIR=""
           if [ "${{ github.event.inputs.archive }}" = "true" ] && [ -d "archives" ] && [ "$(ls -A archives || true)" != "" ]; then
             DIR="archives"
+          elif [ "${{ github.event.inputs.convert }}" = "true" ] && [ -d "converted" ] && [ "$(ls -A converted || true)" != "" ]; then
+            DIR="converted"
+          elif [ -d "downloads" ] && [ "$(ls -A downloads || true)" != "" ]; then
+            DIR="downloads"
           fi
 
-          if [ ! -d "$DIR" ] || [ "$(ls -A "$DIR" || true)" = "" ]; then
-            echo "No files to upload in $DIR; nothing to do."
+          if [ -z "$DIR" ]; then
+            echo "No files to upload (archives/converted/downloads are empty); nothing to do."
             exit 0
           fi
 
-          for f in "$DIR"/*; do
-            [ -f "$f" ] || continue
+          echo "Uploading files from directory: $DIR"
+
+          # Upload files recursively (handles nested files in downloads/)
+          find "$DIR" -type f -print0 | while IFS= read -r -d '' f; do
             fname=$(basename "$f")
-            echo "Uploading $fname ..."
-            # use curl to upload each asset (retry, small delay)
+            echo "Uploading $f as asset name $fname ..."
+            # use curl to upload each asset (retry with backoff)
             for i in 1 2 3; do
               if curl --fail -sS -X POST \
                   -H "Authorization: token $GITHUB_TOKEN" \
