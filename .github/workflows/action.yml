@@ -1,195 +1,134 @@
-name: upload-to-ftp
+name: Download and Convert Video to 480p
+
 on:
   workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'URL of the file to download'
+        required: true
+        type: string
 
 jobs:
-  upload:
+  process-video:
     runs-on: ubuntu-latest
+
     steps:
+      # Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Set up Python
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: '3.11'
 
-      - name: Download, extract and upload to FTP (inlined Python)
-        env:
-          ZIP_URL: "https://github.com/SCPF-Bot/mozilla.android/releases/download/latest/pD2ZOpEeq5.zip"
-          ZIP_NAME: "pD2ZOpEeq5.zip"
-          EXTRACT_DIR: "extracted"
-          FTP_HOST_PORT: "ftp.minefort.com:21"
-          FTP_USER: "CEBJxQ9wt5"
-          FTP_PASS: "gQT90ExX3a"
-          REMOTE_BASE_DIR: ""  # set a remote base path here if desired
+      # Install ffmpeg
+      - name: Install ffmpeg
         run: |
-          python3 - <<'PY'
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      # Install Python dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests tqdm
+
+      # Create a directory for downloads and converted files
+      - name: Create directories
+        run: |
+          mkdir -p downloads
+          mkdir -p converted
+
+      # Download file with progress bar
+      - name: Download file
+        run: |
+          python -c "
+          import requests
+          from tqdm import tqdm
           import os
-          import shutil
-          import urllib.request
-          import zipfile
-          import ftplib
 
-          ZIP_URL = os.environ.get("ZIP_URL")
-          ZIP_NAME = os.environ.get("ZIP_NAME", "pD2ZOpEeq5.zip")
-          EXTRACT_DIR = os.environ.get("EXTRACT_DIR", "extracted")
-          FTP_HOST_PORT = os.environ.get("FTP_HOST_PORT", "ftp.minefort.com:21")
-          FTP_USER = os.environ.get("FTP_USER")
-          FTP_PASS = os.environ.get("FTP_PASS")
-          REMOTE_BASE_DIR = os.environ.get("REMOTE_BASE_DIR", "")
+          url = '${{ github.event.inputs.file_url }}'
+          filename = url.split('/')[-1]
+          output_path = f'downloads/{filename}'
 
-          def parse_host_port(hp: str):
-              if ":" in hp:
-                  host, port = hp.rsplit(":", 1)
-                  try:
-                      return host, int(port)
-                  except ValueError:
-                      return host, 21
-              return hp, 21
+          response = requests.get(url, stream=True)
+          total_size = int(response.headers.get('content-length', 0))
+          
+          # Download with progress bar
+          with tqdm(total=total_size, unit='B', unit_scale=True, desc=filename) as progress:
+              with open(output_path, 'wb') as f:
+                  for chunk in response.iter_content(chunk_size=8192):
+                      if chunk:
+                          f.write(chunk)
+                          progress.update(len(chunk))
+          "
 
-          def download_zip(url: str, dest: str):
-              print(f"Downloading {url} -> {dest}")
-              urllib.request.urlretrieve(url, dest)
-              print("Download completed.")
+      # Convert video files to 480p, rename, and delete originals
+      - name: Convert videos to 480p
+        run: |
+          python -c "
+          import os
+          import subprocess
+          import glob
 
-          def extract_zip(zip_path: str, extract_to: str):
-              print(f"Extracting {zip_path} -> {extract_to}")
-              with zipfile.ZipFile(zip_path, "r") as zf:
-                  zf.extractall(extract_to)
-              print("Extraction completed.")
+          download_dir = 'downloads'
+          converted_dir = 'converted'
 
-          def remove_file(path: str):
-              try:
-                  os.remove(path)
-                  print(f"Removed file {path}")
-              except FileNotFoundError:
-                  print(f"File {path} not found, skipping removal.")
+          # Supported video extensions
+          video_extensions = ['*.mp4', '*.mkv', '*.avi', '*.mov', '*.flv', '*.wmv']
 
-          def ensure_remote_dir(ftp: ftplib.FTP, remote_dir: str):
-              """
-              Ensure the remote directory exists by creating each segment if necessary.
-              Leaves the FTP current working directory at the target directory.
-              """
-              if not remote_dir:
-                  # if remote_dir is empty, leave ftp cwd as-is (server's default)
-                  return
-              parts = [p for p in remote_dir.replace("\\", "/").split("/") if p]
-              try:
-                  ftp.cwd("/")
-              except Exception:
-                  # some servers disallow changing to root; continue from current dir
-                  pass
-              for part in parts:
-                  try:
-                      ftp.cwd(part)
-                  except ftplib.error_perm:
-                      try:
-                          ftp.mkd(part)
-                          ftp.cwd(part)
-                      except Exception as e:
-                          # attempt one more time to cwd; otherwise fail
-                          try:
-                              ftp.cwd(part)
-                          except Exception:
-                              raise RuntimeError(f"Failed to create or enter remote directory '{part}': {e}")
+          for ext in video_extensions:
+              for file_path in glob.glob(f'{download_dir}/{ext}'):
+                  filename = os.path.basename(file_path)
+                  # Replace spaces with dots
+                  new_filename = '480' + filename.replace(' ', '.')
+                  output_path = os.path.join(converted_dir, new_filename)
 
-          def remote_file_size(ftp: ftplib.FTP, filename: str):
-              """
-              Return remote file size in bytes if supported, otherwise None.
-              Assumes ftp current working directory is the directory containing filename.
-              """
-              try:
-                  sz = ftp.size(filename)
-                  if sz is None:
-                      return None
-                  return int(sz)
-              except ftplib.error_perm:
-                  # server denies SIZE or file not found
-                  return None
-              except Exception:
-                  # other errors (e.g., not supported)
-                  return None
+                  # Convert video to 480p with automatic adjustments
+                  cmd = [
+                      'ffmpeg',
+                      '-i', file_path,
+                      '-vf', 'scale=-2:480',
+                      '-c:v', 'libx264',
+                      '-preset', 'medium',
+                      '-crf', '23',
+                      '-c:a', 'aac',
+                      '-b:a', '128k',
+                      '-y',  # Overwrite output files without asking
+                      output_path
+                  ]
+                  subprocess.run(cmd, check=True)
+                  
+                  # Delete original file
+                  os.remove(file_path)
+          "
 
-          def upload_directory(ftp: ftplib.FTP, local_dir: str, remote_base: str = ""):
-              local_dir = os.path.abspath(local_dir)
-              for root, dirs, files in os.walk(local_dir):
-                  rel = os.path.relpath(root, local_dir)
-                  if rel == ".":
-                      remote_dir = remote_base
-                  else:
-                      # normalize to POSIX path for FTP
-                      remote_dir = "/".join(filter(None, [remote_base, rel.replace(os.sep, "/")]))
+      # Create a release and upload converted files
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: latest
+          release_name: Latest Release
+          draft: false
+          prerelease: false
 
-                  # Ensure remote dir exists and cwd into it (if remote_dir empty, ensure_remote_dir will no-op)
-                  ensure_remote_dir(ftp, remote_dir)
+      # Upload converted files to the release
+      - name: Upload Release Assets
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: converted/*
+          asset_name: '*.mp4,*.mkv,*.avi,*.mov,*.flv,*.wmv'
+          asset_content_type: video/*
 
-                  for filename in files:
-                      local_path = os.path.join(root, filename)
-                      local_size = os.path.getsize(local_path)
-                      # Check remote file size (in current working directory)
-                      remote_sz = remote_file_size(ftp, filename)
-                      if remote_sz == local_size:
-                          print(f"Skipping {local_path} -> {remote_dir}/{filename} (already uploaded, sizes match: {local_size} bytes)")
-                          continue
-                      if remote_sz is not None and remote_sz > local_size:
-                          # remote file is larger than local (unexpected); overwrite
-                          print(f"Remote file {filename} is larger ({remote_sz} bytes) than local ({local_size} bytes); will overwrite.")
-                      else:
-                          if remote_sz is None:
-                              print(f"No remote size available for {filename}; will upload.")
-                          else:
-                              print(f"Remote file {filename} partial ({remote_sz}/{local_size} bytes); re-uploading to ensure completeness.")
-
-                      # Upload file
-                      print(f"Uploading {local_path} -> {remote_dir}/{filename}")
-                      with open(local_path, "rb") as fp:
-                          try:
-                              ftp.storbinary(f"STOR {filename}", fp)
-                          except Exception as e:
-                              raise RuntimeError(f"Failed to upload {local_path}: {e}")
-
-                      # Verify after upload: check remote size equals local size
-                      after_sz = remote_file_size(ftp, filename)
-                      if after_sz is None:
-                          # Server doesn't support SIZE; best-effort - we consider upload done
-                          print(f"Warning: server does not report size for {filename}; cannot verify completeness.")
-                      elif after_sz != local_size:
-                          raise RuntimeError(f"Upload verification failed for {filename}: local {local_size} bytes, remote {after_sz} bytes")
-                      else:
-                          print(f"Verified {filename}: {after_sz} bytes (matches local)")
-
-          def main():
-              # Clean start
-              if os.path.isdir(EXTRACT_DIR):
-                  shutil.rmtree(EXTRACT_DIR)
-
-              # 1. Download
-              download_zip(ZIP_URL, ZIP_NAME)
-
-              # 2. Extract
-              os.makedirs(EXTRACT_DIR, exist_ok=True)
-              extract_zip(ZIP_NAME, EXTRACT_DIR)
-
-              # 3. Delete the zip
-              remove_file(ZIP_NAME)
-
-              # 4. Upload
-              host, port = parse_host_port(FTP_HOST_PORT)
-              print(f"Connecting to FTP {host}:{port} as {FTP_USER}")
-              ftp = ftplib.FTP()
-              ftp.connect(host, port, timeout=30)
-              ftp.login(FTP_USER, FTP_PASS)
-              print("FTP connected and logged in.")
-              try:
-                  upload_directory(ftp, EXTRACT_DIR, REMOTE_BASE_DIR)
-              finally:
-                  try:
-                      ftp.quit()
-                  except Exception:
-                      try:
-                          ftp.close()
-                      except Exception:
-                          pass
-              print("Upload finished.")
-
-          if __name__ == "__main__":
-              main()
-          PY
+      # Clean up directories
+      - name: Clean up
+        run: |
+          rm -rf downloads converted
