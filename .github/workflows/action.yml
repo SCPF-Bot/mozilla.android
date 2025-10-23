@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'URL (direct, magnet, tpb.party, or 1337x.to)'
+        description: 'URL of the file or torrent page to download (supports direct URLs, magnet links, or torrent detail pages from various sites)'
         required: true
         type: string
 
@@ -31,22 +31,24 @@ jobs:
           ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
           if url.startswith('magnet:'):
               subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', url], check=True)
-          elif 'tpb.party' in url.lower() or '1337x.to' in url.lower():
-              site = 'tpb.party' if 'tpb.party' in url.lower() else '1337x.to'
-              r = requests.get(url, headers={'User-Agent': ua}, timeout=10)
-              r.raise_for_status()
-              soup = BeautifulSoup(r.text, 'html.parser')
-              magnet = next((a['href'] for a in soup.find_all('a', href=lambda h: h and h.startswith('magnet:')), None) or \
-                       next((a['href'] for d in soup.find_all('div', class_=re.compile('download|magnet|torrent')) for a in d.find_all('a', href=lambda h: h and h.startswith('magnet:'))), None) or \
-                       next((a['href'] for a in soup.find_all('a', string=re.compile('get.*torrent|magnet' if site == 'tpb.party' else 'magnet.*download|download.*magnet', re.I)) if a.get('href', '').startswith('magnet:')), None)
-              if not magnet:
-                  with open('page.html', 'w') as f: f.write(soup.prettify())
-                  raise ValueError(f'No magnet link found on {site}')
-              subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', magnet], check=True)
           else:
-              subprocess.run(['curl', '--retry', '3', '--head', '--fail', '--silent', '--user-agent', ua, url], check=True)
-              filename = url.split('/')[-1]
-              subprocess.run(['wget', '--progress=bar:force', f'--output-document=downloads/{filename}', '--user-agent', ua, url], check=True)
+              head_r = requests.head(url, headers={'User-Agent': ua}, timeout=10, allow_redirects=True)
+              content_type = head_r.headers.get('Content-Type', '').lower()
+              if 'text/html' in content_type:
+                  r = requests.get(url, headers={'User-Agent': ua}, timeout=10)
+                  r.raise_for_status()
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  magnet = next((a['href'] for a in soup.find_all('a', href=lambda h: h and h.startswith('magnet:')), None) or \
+                           next((a['href'] for d in soup.find_all('div', class_=re.compile('download|magnet|torrent')) for a in d.find_all('a', href=lambda h: h and h.startswith('magnet:'))), None) or \
+                           next((a['href'] for a in soup.find_all('a', string=re.compile('magnet|download|torrent|get.*torrent', re.I)) if a.get('href', '').startswith('magnet:')), None)
+                  if not magnet:
+                      with open('page.html', 'w') as f: f.write(soup.prettify())
+                      raise ValueError('No magnet link found on the page')
+                  subprocess.run(['aria2c', '--dir=downloads', '--seed-time=0', '--summary-interval=10', magnet], check=True)
+              else:
+                  subprocess.run(['curl', '--retry', '3', '--head', '--fail', '--silent', '--user-agent', ua, url], check=True)
+                  filename = url.split('/')[-1]
+                  subprocess.run(['wget', '--progress=bar:force', f'--output-document=downloads/{filename}', '--user-agent', ua, url], check=True)
           "
       - name: Convert videos to 480p
         run: |
