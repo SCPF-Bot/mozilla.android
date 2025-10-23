@@ -1,270 +1,221 @@
-import sys
 import os
 import random
-import requests
-from bs4 import BeautifulSoup
-from fake_useragent import UserAgent
 import subprocess
-import shutil
-from PIL import Image
-import zipfile
-import re
-import time
+import requests
+import magic
+from urllib.parse import urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException
+import time
+import sys
+from PIL import Image
+from io import BytesIO
+from bs4 import BeautifulSoup
+import shutil
 
-# Get inputs
-main_url = sys.argv[1]
-do_compress = sys.argv[2].lower() == 'true'
-do_archive = sys.argv[3].lower() == 'true'
+# Realistic user agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/118.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/118.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Edg/118.0.2088.46",
+]
 
-# Create files dir
-os.makedirs("files", exist_ok=True)
-os.chdir("files")
+def get_random_user_agent():
+    return random.choice(USER_AGENTS)
 
-# User agent
-ua = UserAgent()
-user_agent = ua.random
-
-# Function to get filename from URL or headers
-def get_filename(link):
+def get_true_filename(url):
+    user_agent = get_random_user_agent()
     try:
-        head = requests.head(link, allow_redirects=True, headers={'User-Agent': user_agent})
-        if 'Content-Disposition' in head.headers:
-            cd = head.headers['Content-Disposition']
-            if 'filename=' in cd:
-                return cd.split('filename=')[1].strip('"')
-        return os.path.basename(link.split('?')[0]) or 'downloaded_file'
+        response = requests.head(url, headers={"User-Agent": user_agent}, allow_redirects=True)
+        if response.status_code == 200:
+            content_disp = response.headers.get('Content-Disposition')
+            if content_disp:
+                import re
+                fname = re.findall("filename=(.+)", content_disp)
+                if fname:
+                    return fname[0].strip('"')
+            content_type = response.headers.get('Content-Type', '').split(';')[0]
+            ext = mimetypes.guess_extension(content_type) or ''
+            parsed = urlparse(url)
+            fname = os.path.basename(parsed.path)
+            if not fname.endswith(ext):
+                fname += ext
+            return fname
     except:
-        return 'downloaded_file'
+        pass
+    parsed = urlparse(url)
+    return os.path.basename(parsed.path) or 'downloaded_file'
 
-# Function to download with aria2 (progress bar via aria2 output)
-def aria_download(link, out=None):
-    cmd = ['aria2c', '--user-agent', user_agent, '--dir=.', '--summary-interval=1', '--auto-file-renaming=false']
-    if out:
-        cmd += ['--out', out]
-    cmd += [link]
-    subprocess.run(cmd, check=True)
-
-# Function to scrape magnet from page (with Selenium fallback for JS)
-def scrape_magnet(page_url):
-    headers = {
-        'User-Agent': user_agent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://www.google.com/',
-    }
-    # First try with requests
-    for attempt in range(3):
-        try:
-            resp = requests.get(page_url, headers=headers, timeout=10, allow_redirects=True)
-            if resp.status_code != 200:
-                continue
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            # Find anchors with magnet href
-            magnets = [a['href'] for a in soup.find_all('a', href=True) if a['href'].startswith('magnet:')]
-            if magnets:
-                return magnets[0]
-            # Fallback: search for common classes or buttons
-            for selector in ['a[href^="magnet:"]', 'a.btn-magnet', 'a.magnet-link', 'a[title*="Magnet"]']:
-                found = soup.select(selector)
-                if found and found[0].get('href'):
-                    return found[0]['href']
-            # Fallback regex on raw text
-            magnet_pattern = re.compile(r'(magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^\s\'"]*)', re.IGNORECASE)
-            found = magnet_pattern.findall(resp.text)
-            if found:
-                return found[0]
-        except Exception as e:
-            print(f"Requests scrape attempt {attempt+1} failed: {e}")
-            time.sleep(2)
-
-    # Fallback to Selenium for JS-rendered content
+def download_with_progress(url, output_path):
+    user_agent = get_random_user_agent()
+    # Try wget first
     try:
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--disable-infobars")
-        options.add_argument("--remote-debugging-port=9222")
-        options.add_argument(f"user-agent={user_agent}")
-        service = Service(executable_path="chromedriver")
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.get(page_url)
-        time.sleep(5)  # Wait for JS to load
+        subprocess.run(['wget', '--user-agent', user_agent, '--progress=bar:force:noscroll', '-O', output_path, url], check=True)
+        return True
+    except:
+        pass
+    # Fallback to curl
+    try:
+        subprocess.run(['curl', '-A', user_agent, '--progress-bar', '-o', output_path, url], check=True)
+        return True
+    except:
+        return False
 
-        # Find magnet links
+def setup_selenium():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(f"user-agent={get_random_user_agent()}")
+    driver = webdriver.Chrome(options=options)
+    return driver
+
+def scrape_magnet(url):
+    driver = setup_selenium()
+    try:
+        driver.get(url)
+        time.sleep(5)  # Wait for load
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        magnet_links = [a['href'] for a in soup.find_all('a', href=True) if a['href'].startswith('magnet:')]
+        if magnet_links:
+            return magnet_links[0]  # Take first
+        # Or find buttons, etc.
         try:
-            magnet_elements = driver.find_elements(By.CSS_SELECTOR, 'a[href^="magnet:"]')
-            if magnet_elements:
-                return magnet_elements[0].get_attribute('href')
+            magnet_button = driver.find_element(By.XPATH, "//a[contains(@href, 'magnet:')]")
+            return magnet_button.get_attribute('href')
         except NoSuchElementException:
             pass
-
-        # Fallback selectors
-        for selector in ['a.btn-magnet', 'a.magnet-link', 'a[title*="Magnet"]', 'button[data-magnet]', 'a[href*="magnet"]']:
-            try:
-                elem = driver.find_element(By.CSS_SELECTOR, selector)
-                href = elem.get_attribute('href')
-                if href and href.startswith('magnet:'):
-                    return href
-            except NoSuchElementException:
-                pass
-
-        # Regex on page source
-        page_source = driver.page_source
-        magnet_pattern = re.compile(r'(magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^\s\'"]*)', re.IGNORECASE)
-        found = magnet_pattern.findall(page_source)
-        if found:
-            return found[0]
-
+    finally:
         driver.quit()
-    except (TimeoutException, WebDriverException) as e:
-        print(f"Selenium scrape failed: {e}")
-        if 'driver' in locals():
-            driver.quit()
     return None
 
-# Function to handle a single link
-def handle_link(link):
+def download_torrent_or_magnet(link, output_dir):
     if link.startswith('magnet:'):
-        aria_download(link)
-        return
-
-    ext = os.path.splitext(link)[1].lower()
-    if ext == '.torrent':
-        torrent_file = get_filename(link) or 'temp.torrent'
-        aria_download(link, torrent_file)
-        aria_download(torrent_file)
-        os.remove(torrent_file)
-        return
-
-    try:
-        head = requests.head(link, allow_redirects=True, headers={'User-Agent': user_agent})
-        ct = head.headers.get('Content-Type', '')
-    except:
-        ct = ''
-
-    if 'text/html' in ct:
+        subprocess.run(['aria2c', '--dir', output_dir, '--summary-interval=0', link], check=True)
+        return True
+    elif link.endswith('.torrent'):
+        torrent_file = os.path.join(output_dir, 'temp.torrent')
+        if download_with_progress(link, torrent_file):
+            subprocess.run(['aria2c', '--dir', output_dir, '--summary-interval=0', torrent_file], check=True)
+            os.remove(torrent_file)
+            return True
+    else:
+        # Assume it's a page with magnet
         magnet = scrape_magnet(link)
         if magnet:
-            aria_download(magnet)
-            return
-    # Fallback to direct download
-    fn = get_filename(link)
-    aria_download(link, fn)
+            subprocess.run(['aria2c', '--dir', output_dir, '--summary-interval=0', magnet], check=True)
+            return True
+    return False
 
-# Function to flatten any subdirectories (e.g., from multi-file torrents)
-def flatten():
-    for item in list(os.listdir('.')):
-        if os.path.isdir(item):
-            for sub in os.listdir(item):
-                src = os.path.join(item, sub)
-                dst = sub
-                i = 1
-                while os.path.exists(dst):
-                    name, ext = os.path.splitext(sub)
-                    dst = f"{name}_{i}{ext}"
-                    i += 1
-                shutil.move(src, dst)
-            os.rmdir(item)
+def is_torrent_related(link):
+    return link.startswith('magnet:') or link.endswith('.torrent') or 'torrent' in link.lower()
 
-# Collect downloaded files
-downloaded_files = []
+def rename_file(file_path):
+    dirname, filename = os.path.split(file_path)
+    filename = filename.replace(' ', '.')
+    prefix = f"{random.randint(0, 9999):04d}."
+    new_name = prefix + filename
+    new_path = os.path.join(dirname, new_name)
+    os.rename(file_path, new_path)
+    return new_path
 
-# Function to handle and collect new files
-def handle_and_collect(link):
-    before = set(os.listdir('.'))
-    handle_link(link)
-    flatten()
-    after = set(os.listdir('.'))
-    new_files = list(after - before)
-    downloaded_files.extend(new_files)
+def compress_file(file_path):
+    mime = magic.Magic(mime=True).from_file(file_path)
+    if 'video' in mime:
+        output = file_path + '.compressed.mp4'
+        subprocess.run(['ffmpeg', '-i', file_path, '-vf', 'scale=-2:480', '-crf', '28', '-preset', 'slow', output], check=True)
+        os.remove(file_path)
+        os.rename(output, file_path)
+    elif 'image' in mime:
+        with Image.open(file_path) as img:
+            if img.mode in ('RGBA', 'LA'):
+                img = img.convert('RGB')
+            img.save(file_path, quality=50, optimize=True)
+    elif 'audio' in mime:
+        output = file_path + '.compressed.mp3'
+        subprocess.run(['ffmpeg', '-i', file_path, '-b:a', '64k', output], check=True)
+        os.remove(file_path)
+        os.rename(output, file_path)
+    # For APK (zip), simple recompress
+    elif mime == 'application/zip' and file_path.endswith('.apk'):
+        temp_dir = file_path + '_temp'
+        os.makedirs(temp_dir)
+        shutil.unpack_archive(file_path, temp_dir, 'zip')
+        # Compress images inside
+        for root, dirs, files in os.walk(temp_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                if magic.Magic(mime=True).from_file(fp).startswith('image/'):
+                    compress_file(fp)  # Recursive for images
+        shutil.make_archive(file_path[:-4], 'zip', temp_dir)
+        os.rename(file_path[:-4] + '.zip', file_path)
+        shutil.rmtree(temp_dir)
+    # Other types, skip
 
-# Process main URL
-is_txt_list = False
-if main_url.lower().endswith('.txt'):
-    temp_fn = 'temp.txt'
-    aria_download(main_url, temp_fn)
-    with open(temp_fn, 'r') as f:
-        lines = [l.strip() for l in f if l.strip()]
-    if all(l.startswith(('http://', 'https://', 'magnet:')) for l in lines):
-        is_txt_list = True
-        for l in lines:
-            handle_and_collect(l)
-        os.remove(temp_fn)
+def archive_file(file_path):
+    output = file_path + '.7z'
+    subprocess.run(['7z', 'a', '-mx=9', output, file_path], check=True)
+    os.remove(file_path)
+    return output
+
+def process_download(url, compress=False, archive=False):
+    os.makedirs('files', exist_ok=True)
+    if url.endswith('.txt'):
+        txt_path = os.path.join('files', 'url.txt')
+        if download_with_progress(url, txt_path):
+            with open(txt_path, 'r') as f:
+                lines = f.readlines()
+            is_url_list = all(line.strip().startswith('http') for line in lines if line.strip())
+            if not is_url_list:
+                # Download normally
+                new_path = rename_file(txt_path)
+                if compress:
+                    compress_file(new_path)
+                if archive:
+                    archive_file(new_path)
+                return
+            else:
+                # Process each URL
+                os.remove(txt_path)  # Don't keep url.txt
+                for line in lines:
+                    sub_url = line.strip()
+                    if sub_url:
+                        download_single(sub_url, compress, archive)
+                return
+    download_single(url, compress, archive)
+
+def download_single(url, compress, archive):
+    if is_torrent_related(url):
+        # For torrents, aria2 downloads to dir, files will be there
+        download_torrent_or_magnet(url, 'files')
+        # Then process files in dir
+        for f in os.listdir('files'):
+            fp = os.path.join('files', f)
+            if os.path.isfile(fp) and f not in ['download.py', 'url.txt']:
+                new_fp = rename_file(fp)
+                if compress:
+                    compress_file(new_fp)
+                if archive:
+                    archive_file(new_fp)
     else:
-        fn = get_filename(main_url)
-        os.rename(temp_fn, fn)
-        downloaded_files.append(fn)
-else:
-    handle_and_collect(main_url)
+        filename = get_true_filename(url)
+        temp_path = os.path.join('files', filename)
+        if download_with_progress(url, temp_path):
+            new_path = rename_file(temp_path)
+            if compress:
+                compress_file(new_path)
+            if archive:
+                archive_file(new_path)
 
-# Rename files: replace spaces with ., add 4-digit random prefix
-updated_files = []
-for f in downloaded_files:
-    base = f.replace(' ', '.')
-    prefix = f"{random.randint(1000, 9999)}."
-    new_name = prefix + base
-    os.rename(f, new_name)
-    updated_files.append(new_name)
-
-# Compress if enabled
-if do_compress:
-    for i, file in enumerate(updated_files):
-        ext = os.path.splitext(file)[1].lower()
-        if ext in ['.mp4', '.mkv', '.avi']:
-            # Compress video to 480p
-            temp_fn = file + '_comp.mp4'
-            subprocess.run(['ffmpeg', '-i', file, '-vf', 'scale=-2:480', '-c:v', 'libx264', '-crf', '23', '-preset', 'medium', '-c:a', 'aac', '-strict', 'experimental', temp_fn], check=True)
-            os.remove(file)
-            os.rename(temp_fn, file)
-        elif ext in ['.jpg', '.jpeg', '.png']:
-            # Reduce image size
-            try:
-                img = Image.open(file)
-                img = img.resize((img.width // 2, img.height // 2), Image.LANCZOS)
-                img.save(file, quality=70 if ext in ['.jpg', '.jpeg'] else 75, optimize=True)
-            except:
-                pass
-        elif ext == '.apk':
-            # Compress images in APK
-            temp_dir = 'temp_apk'
-            os.makedirs(temp_dir, exist_ok=True)
-            with zipfile.ZipFile(file, 'r') as z:
-                z.extractall(temp_dir)
-            for root, _, files in os.walk(temp_dir):
-                for f in files:
-                    if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        path = os.path.join(root, f)
-                        try:
-                            img = Image.open(path)
-                            img.save(path, quality=70 if '.jpg' in f.lower() or '.jpeg' in f.lower() else 75, optimize=True)
-                        except:
-                            pass
-            base_name = file[:-4]
-            shutil.make_archive(base_name, 'zip', temp_dir)
-            os.remove(file)
-            os.rename(base_name + '.zip', file)
-            shutil.rmtree(temp_dir)
-
-# Archive if enabled
-if do_archive:
-    archived_files = []
-    for file in updated_files:
-        archive_fn = file + '.7z'
-        subprocess.run(['7z', 'a', '-mx=9', archive_fn, file], check=True)
-        os.remove(file)
-        archived_files.append(archive_fn)
-    updated_files = archived_files
-
-# Create release notes
-repo = os.environ['GITHUB_REPOSITORY']
-with open('../notes.md', 'w') as f:
-    f.write('# Latest Downloads\n\nDownloaded files:\n')
-    for file in updated_files:
-        f.write(f"- [{file}](https://github.com/{repo}/releases/download/latest/{file})\n")
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python download.py <url> [compress] [archive]")
+        sys.exit(1)
+    url = sys.argv[1]
+    compress = sys.argv[2].lower() == 'true' if len(sys.argv) > 2 else False
+    archive = sys.argv[3].lower() == 'true' if len(sys.argv) > 3 else False
+    process_download(url, compress, archive)
