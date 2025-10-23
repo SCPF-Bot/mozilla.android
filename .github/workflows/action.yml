@@ -1,19 +1,19 @@
-name: Download and Release
+name: Download Workflow
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL, magnet, or torrent link'
+        description: 'URL, magnet link, torrent link, or .txt file with links'
         required: true
         type: string
       compress:
-        description: 'Compress files'
+        description: 'Compress applicable files (e.g., videos to 480p, images reduced size, APK images compressed)'
         required: false
         type: boolean
         default: false
       archive:
-        description: 'Archive files'
+        description: 'Archive each file individually with maximum compression (7z)'
         required: false
         type: boolean
         default: false
@@ -29,181 +29,31 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Set up Chromedriver
+        uses: nanasess/setup-chromedriver@v2
+
       - name: Install dependencies
         run: |
-          pip install requests beautifulsoup4 tqdm pillow
           sudo apt update
-          sudo apt install aria2 ffmpeg p7zip-full -y
+          sudo apt install -y aria2 ffmpeg p7zip-full curl wget
+          pip install requests beautifulsoup4 fake-useragent pillow selenium
 
-      - name: Create Python script
-        run: |
-          cat << 'EOF' > script.py
-          import sys
-          import os
-          import random
-          import requests
-          import subprocess
-          import shutil
-          from urllib.parse import urlparse
-          from bs4 import BeautifulSoup
-          from pathlib import Path
-          from PIL import Image
-          import zipfile
-          import re
-
-          def get_filename(response, url):
-              disp = response.headers.get('content-disposition')
-              if disp:
-                  fname = re.findall('filename="?(.+)"?', disp)
-                  if fname:
-                      return fname[0]
-              return Path(urlparse(url).path).name or 'download'
-
-          def flatten_dir():
-              for root, dirs, files in os.walk('.', topdown=False):
-                  for f in files:
-                      if root != '.':
-                          shutil.move(os.path.join(root, f), os.path.join('.', f))
-                  for d in dirs:
-                      try:
-                          os.rmdir(os.path.join(root, d))
-                      except:
-                          pass
-
-          def compress_file(fn):
-              ext = Path(fn).suffix.lower()
-              if ext in ['.mp4', '.avi', '.mkv', '.mov']:
-                  out = 'comp_' + fn
-                  cmd = ['ffmpeg', '-i', fn, '-vf', 'scale=-2:480', '-c:v', 'libx264', '-preset', 'slow', '-crf', '28', '-y', out]
-                  subprocess.run(cmd, capture_output=True)
-                  if os.path.exists(out):
-                      os.remove(fn)
-                      os.rename(out, fn)
-              elif ext in ['.jpg', '.jpeg', '.png']:
-                  try:
-                      img = Image.open(fn)
-                      if ext == '.png':
-                          img.save(fn, optimize=True, quality=65)
-                      else:
-                          img.save(fn, quality=65)
-                  except:
-                      pass
-              elif ext == '.apk':
-                  temp_dir = 'temp_apk'
-                  try:
-                      os.makedirs(temp_dir, exist_ok=True)
-                      with zipfile.ZipFile(fn, 'r') as z:
-                          z.extractall(temp_dir)
-                      for root, _, files in os.walk(temp_dir):
-                          for ff in files:
-                              if ff.lower().endswith(('.png', '.jpg', '.jpeg')):
-                                  p = os.path.join(root, ff)
-                                  try:
-                                      img = Image.open(p)
-                                      img.save(p, optimize=True, quality=65)
-                                  except:
-                                      pass
-                      shutil.make_archive('comp_apk', 'zip', temp_dir)
-                      os.remove(fn)
-                      os.rename('comp_apk.zip', fn)
-                  except:
-                      pass
-                  finally:
-                      if os.path.exists(temp_dir):
-                          shutil.rmtree(temp_dir)
-
-          def download_link(link, ua):
-              if link.startswith('magnet:'):
-                  cmd = ['aria2c', '--dir=.', '--user-agent=' + ua, '--seed-time=0', '--summary-interval=0', link]
-                  subprocess.run(cmd, capture_output=True)
-              elif link.endswith('.torrent'):
-                  tor_fn = get_filename(requests.head(link, allow_redirects=True), link)
-                  subprocess.run(['aria2c', '--dir=.', '--out=' + tor_fn, '--user-agent=' + ua, '--summary-interval=0', link])
-                  subprocess.run(['aria2c', '--dir=.', '--seed-time=0', '--summary-interval=0', tor_fn])
-                  os.remove(tor_fn)
-              else:
-                  try:
-                      head_r = requests.head(link, headers={'User-Agent': ua}, allow_redirects=True, timeout=10)
-                      ctype = head_r.headers.get('Content-Type', '').lower()
-                  except:
-                      ctype = ''
-                  if 'html' in ctype:
-                      try:
-                          get_r = requests.get(link, headers={'User-Agent': ua}, timeout=10)
-                          soup = BeautifulSoup(get_r.text, 'html.parser')
-                          magnets = soup.find_all('a', href=lambda h: h and h.startswith('magnet:'))
-                          if magnets:
-                              for mag in magnets:
-                                  download_link(mag['href'], ua)
-                              return
-                      except:
-                          pass
-                  fn = get_filename(head_r, link)
-                  subprocess.run(['aria2c', '--dir=.', '--out=' + fn, '--user-agent=' + ua, '--summary-interval=0', link])
-
-          if __name__ == '__main__':
-              url = sys.argv[1]
-              compress = sys.argv[2].lower() == 'true'
-              archive = sys.argv[3].lower() == 'true'
-              ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-              os.makedirs('files', exist_ok=True)
-              os.chdir('files')
-              is_txt_list = False
-              if url.endswith('.txt'):
-                  txt_fn = 'temp.txt'
-                  subprocess.run(['aria2c', '--dir=.', '--out=' + txt_fn, '--user-agent=' + ua, '--summary-interval=0', url])
-                  with open(txt_fn, 'r', errors='ignore') as f:
-                      lines = [line.strip() for line in f.readlines() if line.strip()]
-                  is_list = all(line.startswith('http') or line.startswith('magnet:') for line in lines)
-                  if is_list:
-                      for line in lines:
-                          download_link(line, ua)
-                      is_txt_list = True
-                  os.remove(txt_fn)
-                  if not is_list:
-                      proper_fn = get_filename(requests.head(url, allow_redirects=True), url)
-                      download_link(url, ua)  # Redownload properly
-              else:
-                  download_link(url, ua)
-              flatten_dir()
-              files = [f for f in os.listdir('.') if os.path.isfile(f)]
-              for f in files:
-                  new_f = f.replace(' ', '.')
-                  prefix = f"{random.randint(0, 9999):04d}."
-                  new_f = prefix + new_f
-                  os.rename(f, new_f)
-              if compress:
-                  files = [f for f in os.listdir('.') if os.path.isfile(f)]
-                  for f in files:
-                      compress_file(f)
-              if archive:
-                  files = [f for f in os.listdir('.') if os.path.isfile(f)]
-                  for f in files:
-                      arc = f + '.7z'
-                      subprocess.run(['7z', 'a', '-mx=9', arc, f])
-                      os.remove(f)
-          EOF
-
-      - name: Run Python script
-        run: python script.py "${{ inputs.url }}" "${{ inputs.compress }}" "${{ inputs.archive }}"
-
-      - name: Prepare release notes
-        id: notes
-        run: |
-          notes="Downloaded files:\n"
-          for file in files/*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              notes="$notes - [$filename](https://github.com/${{ github.repository }}/releases/download/latest/$filename)\n"
-            fi
-          done
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          echo "$notes" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Run download script
+        run: python download.py "${{ inputs.url }}" ${{ inputs.compress }} ${{ inputs.archive }}
 
       - name: Create or update release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest --yes || true
-          git push origin :refs/tags/latest || true
-          gh release create latest --title "Latest Downloads" --notes "${{ steps.notes.outputs.notes }}"
-          gh release upload latest files/*
+          release=$(gh release view latest --json id -q .id 2>/dev/null || echo "")
+          if [ -z "$release" ]; then
+            gh release create latest --title "Latest Downloads" -F notes.md
+          else
+            gh release edit latest --title "Latest Downloads" -F notes.md
+          fi
+          gh release upload latest files/* --clobber
